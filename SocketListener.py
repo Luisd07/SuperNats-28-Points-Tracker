@@ -1,4 +1,4 @@
-# ingest_and_publish.py
+
 import argparse, os, socket, time, csv
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
