@@ -1,11 +1,12 @@
 import argparse
 import csv
-import datetime
+from datetime import datetime, timezone, date
 import socket
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
+from sqlalchemy import func  # for seeding last saved lap_no
 
 from db import SessionLocal, init_db
 from models import (
@@ -16,7 +17,6 @@ from models import (
 # --- Helpers ---------------------------------------------------------------
 
 def parseTimeSTR(s: str) -> Optional[float]:
-   
     s = (s or "").strip().strip('"')
     if not s or s in {"0", "00:00.000", "00:00:00", "00:00:00.000"}:
         return None
@@ -48,6 +48,19 @@ def fmt(sec: Optional[float]) -> str:
 def to_ms(seconds: Optional[float]) -> Optional[int]:
     return int(round(seconds * 1000)) if seconds is not None else None
 
+def lock_session_type(name: str) -> str:
+    n = (name or "").lower()
+    if "qual" in n:
+        return "Qualifying"
+    if "heat" in n:
+        return "Heat"
+    elif "prefinal" in n or "pre-final" in n or "pre final" in n:
+        return "Prefinal"  # match enum spelling
+    elif "final" in n:
+        return "Final"
+    elif "practice" in n or "happy hour" in n:
+        return "Practice"
+    return ""
 
 # --- State containers ------------------------------------------------------
 
@@ -58,18 +71,22 @@ class DriverState:
     last: str = ""
     team: str = ""
     chassis: str = ""
+    transponder: str = ""
     active: bool = True
 
 @dataclass
 class TimingState:
     session_name: str = ""
+    session_type: str = ""
     class_name: str = ""
+    event_name: str = ""            # <- captured from $E when available
     track_name: str = ""
     track_length: Optional[float] = None
     flag: str = ""
     last_lap: Dict[str, Optional[float]] = field(default_factory=dict)  # seconds
     best_lap: Dict[str, Optional[float]] = field(default_factory=dict)  # seconds
-    order: List[str] = field(default_factory=list)  # list of numbers in running order (1-based)
+    lap_no: Dict[str, int] = field(default_factory=dict)  # per-driver lap number
+    order: List[str] = field(default_factory=list)  
     drivers: Dict[str, DriverState] = field(default_factory=dict)
 
 
@@ -93,6 +110,7 @@ class OrbitsParser:
 
         if tag == "$B" and len(f) >= 3:
             self.s.session_name = f[2].strip('"')
+            self.s.session_type = lock_session_type(self.s.session_name)
 
         elif tag == "$C" and len(f) >= 3:
             self.s.class_name = f[2].strip('"')
@@ -107,12 +125,15 @@ class OrbitsParser:
                     self.s.track_length = float(val)
                 except:
                     pass
+            elif key in {"MEETING", "EVENT", "EVENTNAME", "TITLE"}:
+                self.s.event_name = val  # capture event/meeting name if present
 
         elif tag == "$A":
             number = f[1].strip('"')
             if not number:
                 return
             d = self.s.drivers.get(number, DriverState(number))
+            d.transponder = f[2].strip('"') if len(f) > 2 else d.transponder
             d.first   = f[4].strip('"') if len(f) > 4 else d.first
             d.last    = f[5].strip('"') if len(f) > 5 else d.last
             d.chassis = f[6].strip('"') if len(f) > 6 else d.chassis
@@ -138,25 +159,34 @@ class OrbitsParser:
             if len(f) > 5:
                 self.s.flag = f[5].strip('"').strip()
 
-        elif tag == "$G":
-            # $G,<position>,"<number>",,"<last_lap>"
+        elif tag == "$G" and len(f) >= 5:
+            # $G,<position>,"<number>",<lap_no>,"<last_lap>"
             number = f[2].strip('"')
             try:
                 pos = int(f[1])
             except:
                 return
+            # capture lap_no
+            try:
+                lap_no = int(f[3])
+                self.s.lap_no[number] = max(lap_no, self.s.lap_no.get(number, 0))
+            except:
+                pass
 
-            # Remove existing occurrance, then insert at pos-1
+            lap = parseTimeSTR(f[4])
+            if lap is not None:
+                self.s.last_lap[number] = lap
+
+            # maintain order
             self.s.order = [c for c in self.s.order if c != number]
             while len(self.s.order) < pos - 1:
                 self.s.order.append("")
             self.s.order.insert(pos - 1, number)
-            # cleanup trailing placeholders (fix)
             while self.s.order and self.s.order[-1] == "":
                 self.s.order.pop()
 
         elif tag == "$H" and len(f) >= 5:
-            # $H,<pos>,"<number>",0,"<last>"
+            # $H,<pos>,"<number>",?, "<last>"
             number = f[2].strip('"')
             lap = parseTimeSTR(f[4])
             if lap is not None:
@@ -169,8 +199,13 @@ class OrbitsParser:
                 self.s.last_lap[number] = lap
 
         elif tag == "$SR" and len(f) >= 5:
-            # $SR,<pos>,"<number>",,"<best>",0
+            # $SR,<pos>,"<number>",<lap_no>,"<best>",0
             number = f[2].strip('"')
+            try:
+                lap_no = int(f[3])
+                self.s.lap_no[number] = max(lap_no, self.s.lap_no.get(number, 0))
+            except:
+                pass
             best = parseTimeSTR(f[4])
             if best is not None:
                 cur = self.s.best_lap.get(number)
@@ -188,19 +223,85 @@ class OrbitsParser:
 # --- DB ingest ------------------------------------------------------------
 
 class DBIngestor:
-    def __init__(self, SessionLocal, event_id: int, class_id: int, session_type: str):
+    def __init__(self, SessionLocal):
         self.SessionLocal = SessionLocal
-        self.event_id = event_id
-        self.class_id = class_id
-        self.session_type = session_type
-        self.lap_counter: Dict[str, int] = {}
+        self.lap_counter: Dict[str, int] = {}     # not used for lap numbering anymore
+        self.saved_lap_no: Dict[str, int] = {}    # number -> last persisted lap_no
 
-    def get_or_create_driver(self, db_session, number: str, driver_state: DriverState) -> Driver:
-       
+    # ----- Event/Class/Session resolution from packets -----
+
+    def _event_name_or_default(self, s: TimingState) -> str:
+        if s.event_name:
+            return s.event_name
+        base = s.track_name or "Auto Event"
+        return f"{base} {date.today().isoformat()}"
+
+    def get_or_create_event(self, db: Session, s: TimingState) -> Event:
+        name = self._event_name_or_default(s)
+        ev = db.query(Event).filter(Event.name == name).one_or_none()
+        if not ev:
+            ev = Event(
+                name=name,
+                start_date=date.today(),
+                end_date=date.today(),
+                location=s.track_name or None,
+            )
+            db.add(ev); db.flush()
+        return ev
+
+    def get_or_create_class(self, db: Session, event_id: int, class_name: str) -> RaceClass:
+        cname = class_name or "Unknown Class"
+        rc = db.query(RaceClass).filter(
+            RaceClass.event_id == event_id,
+            RaceClass.name == cname
+        ).one_or_none()
+        if not rc:
+            rc = RaceClass(event_id=event_id, name=cname)
+            db.add(rc); db.flush()
+        return rc
+
+    def get_or_create_session(self, db: Session, event_id: int, class_id: int,
+                              session_name: str, session_type: str) -> RaceSession:
+        name = session_name or session_type or "Session"
+        sess = db.query(RaceSession).filter(
+            RaceSession.event_id == event_id,
+            RaceSession.class_id == class_id,
+            RaceSession.session_name == name,
+        ).one_or_none()
+        if not sess:
+            sess = RaceSession(
+                event_id=event_id,
+                class_id=class_id,
+                session_name=name,
+                session_type=session_type or "Practice",
+                status="live",
+            )
+            db.add(sess); db.flush()
+        else:
+            # Sync session type if we later infer it
+            if session_type and sess.session_type != session_type:
+                sess.session_type = session_type
+                db.flush()
+        return sess
+
+    # ----- Existing helpers (lightly adapted) -----
+
+    def _last_saved_lap(self, db: Session, session_id: int, driver_id: int, number: str) -> int:
+        """Seed/return the last saved lap_no for this driver in this session."""
+        if number in self.saved_lap_no:
+            return self.saved_lap_no[number]
+        max_no = db.query(func.max(Lap.lap_number)).filter(
+            Lap.session_id == session_id, Lap.driver_id == driver_id
+        ).scalar() or 0
+        self.saved_lap_no[number] = max_no
+        return max_no
+
+    def get_or_create_driver(self, db: Session, number: str, driver_state: DriverState) -> Driver:
         driver = (
-            db_session.query(Driver)
+            db.query(Driver)
             .filter(
                 getattr(Driver, "first_name") == driver_state.first,
+                getattr(Driver, "last_name") == driver_state.last,
             )
             .first()
         )
@@ -211,11 +312,9 @@ class DBIngestor:
                 team=driver_state.team,
                 chassis=driver_state.chassis,
             )
-            db_session.add(driver)
-            db_session.commit()
-            db_session.refresh(driver)
+            db.add(driver)
+            db.flush()
         else:
-            # optional: keep metadata fresh if provided
             changed = False
             if driver_state.first and driver.first_name != driver_state.first:
                 driver.first_name = driver_state.first; changed = True
@@ -226,33 +325,32 @@ class DBIngestor:
             if driver_state.chassis and driver.chassis != driver_state.chassis:
                 driver.chassis = driver_state.chassis; changed = True
             if changed:
-                db_session.commit()
+                db.flush()
         return driver
 
-    def get_or_create_entry(self, db: Session, drv: Driver, number: str) -> Entry:
+    def get_or_create_entry(self, db: Session, drv: Driver, number: str, event_id: int, class_id: int) -> Entry:
         ent = (
             db.query(Entry)
             .filter(
-                Entry.event_id == self.event_id,
-                Entry.class_id == self.class_id,
+                Entry.event_id == event_id,
+                Entry.class_id == class_id,
                 Entry.number == number,
             )
             .first()
         )
         if not ent:
             ent = Entry(
-                event_id=self.event_id,
-                class_id=self.class_id,
+                event_id=event_id,
+                class_id=class_id,
                 driver_id=drv.id,
                 number=number,
                 transponder=None,
             )
             db.add(ent)
-            db.commit()
-            db.refresh(ent)
+            db.flush()
         elif ent.driver_id != drv.id:
             ent.driver_id = drv.id
-            db.commit()
+            db.flush()
         return ent
 
     def get_or_create_result(self, db: Session, session_id: int, driver_id: int) -> Result:
@@ -274,49 +372,26 @@ class DBIngestor:
                 version=1,
             )
             db.add(res)
-            db.commit()
-            db.refresh(res)
+            db.flush()
         return res
-
-    def get_or_create_session(self, db: Session, session_name: str) -> RaceSession:
-        sess = (
-            db.query(RaceSession)
-            .filter(
-                RaceSession.event_id == self.event_id,
-                RaceSession.class_id == self.class_id,
-                RaceSession.session_name == session_name,
-            )
-            .first()
-        )
-        if not sess:
-            sess = RaceSession(
-                event_id=self.event_id,
-                class_id=self.class_id,
-                session_name=session_name or self.session_type,
-                session_type=self.session_type,
-                status="live",
-            )
-            db.add(sess)
-            db.commit()
-            db.refresh(sess)
-        return sess
 
     def apply(self, parsed: OrbitsParser):
         s = parsed.s
         with self.SessionLocal() as db_session:
-            # 1) Ensure the session exists (per event/class + session_name)
-            session = self.get_or_create_session(db_session, s.session_name)
+            # Resolve Event, Class, Session from packets
+            ev = self.get_or_create_event(db_session, s)
+            rc = self.get_or_create_class(db_session, ev.id, s.class_name)
+            sess = self.get_or_create_session(db_session, ev.id, rc.id, s.session_name, s.session_type)
 
-            # 2) Ensure Drivers + Entries exist; build num->driver_id map
+            # Drivers + Entries map
             num_to_driver_id: Dict[str, int] = {}
             for number, driver_state in s.drivers.items():
                 drv = self.get_or_create_driver(db_session, number, driver_state)
-                self.get_or_create_entry(db_session, drv, number)  # bind to (event_id, class_id)
+                self.get_or_create_entry(db_session, drv, number, ev.id, rc.id)
                 num_to_driver_id[number] = drv.id
 
-            # 3) Normalize ordering and compute the leader's best lap (ms) once
+            # Leader best lap
             ordered_nums = [c for c in s.order if c and c in num_to_driver_id]
-
             leader_best_ms: Optional[int] = None
             for c in ordered_nums:
                 b_sec = s.best_lap.get(c)
@@ -324,10 +399,10 @@ class DBIngestor:
                     leader_best_ms = to_ms(b_sec)
                     break
 
-            # 4) Upsert results for each ordered driver
+            # Upsert results (provisional)
             for idx, number in enumerate(ordered_nums, start=1):
                 driver_id = num_to_driver_id[number]
-                result = self.get_or_create_result(db_session, session.id, driver_id)
+                result = self.get_or_create_result(db_session, sess.id, driver_id)
 
                 last_sec = s.last_lap.get(number)
                 best_sec = s.best_lap.get(number)
@@ -338,7 +413,6 @@ class DBIngestor:
                 result.position = idx
                 result.last_lap_ms = last_ms
 
-                # Only improve best (avoid overwriting with None or slower)
                 if best_ms is not None and (result.best_lap_ms is None or best_ms < result.best_lap_ms):
                     result.best_lap_ms = best_ms
 
@@ -348,24 +422,35 @@ class DBIngestor:
                 else:
                     result.gap_to_p1_ms = None
 
-            # 5) Append Lap rows for any last laps we saw this tick
-            for number, last_sec in s.last_lap.items():
-                if last_sec is None or number not in num_to_driver_id:
+            # Persist laps only when feed lap_no increases and we have a last-lap time
+            for number, feed_lap_no in s.lap_no.items():
+                if number not in num_to_driver_id:
                     continue
                 driver_id = num_to_driver_id[number]
-                next_idx = self.lap_counter.get(number, 1)
+                last_saved = self._last_saved_lap(db_session, sess.id, driver_id, number)
 
-                db_session.add(
-                    Lap(
-                        session_id=session.id,
-                        driver_id=driver_id,
-                        lap_number=next_idx,
-                        lap_time_ms=to_ms(last_sec),
-                        timestamp=datetime.datetime.now(datetime.timezone.utc),
-                        is_valid=1,
+                if feed_lap_no <= last_saved:
+                    continue
+
+                last_sec = s.last_lap.get(number)
+                last_ms = to_ms(last_sec) if last_sec is not None else None
+                if last_ms is None:
+                    # wait until we receive the last-lap time
+                    continue
+
+                # If the feed jumped more than one, backfill sequentially with same time
+                for ln in range(last_saved + 1, feed_lap_no + 1):
+                    db_session.add(
+                        Lap(
+                            session_id=sess.id,
+                            driver_id=driver_id,
+                            lap_number=ln,
+                            lap_time_ms=last_ms,
+                            timestamp=datetime.now(timezone.utc),
+                            is_valid=1,
+                        )
                     )
-                )
-                self.lap_counter[number] = next_idx + 1
+                self.saved_lap_no[number] = feed_lap_no
 
             db_session.commit()
 
@@ -400,16 +485,11 @@ class OrbitsTCPReader:
             sock = None
             f = None
             try:
-                # Connect
                 sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
                 sock.settimeout(self.read_timeout)
-                # Wrap with text file for clean line iteration
                 f = sock.makefile("r", encoding="utf-8", errors="ignore", newline="\n")
-
-                # Reset backoff after successful connection
                 backoff = 1.0
 
-                # Read loop: one Orbits packet per line
                 for line in f:
                     if self._stop:
                         break
@@ -417,11 +497,9 @@ class OrbitsTCPReader:
                     if not line:
                         continue
 
-                    # Parse & ingest
                     self.parser.parseLine(line)
                     self.ingestor.apply(self.parser)
 
-                # Connection closed by peer; loop will reconnect
             except (socket.timeout, ConnectionError, OSError):
                 time.sleep(backoff)
                 backoff = min(self.max_backoff, backoff * 2)
@@ -436,29 +514,16 @@ class OrbitsTCPReader:
                     pass
 
 if __name__ == "__main__":
-    import argparse
-
-    # Initialize DB (uses your existing init_db)
     init_db()
 
     ap = argparse.ArgumentParser(description="Orbits TCP -> Parser -> DB ingestor")
     ap.add_argument("--host", default="127.0.0.1", help="Orbits TCP host")
     ap.add_argument("--port", type=int, default=50000, help="Orbits TCP port")
-    ap.add_argument("--event-id", type=int, required=True, help="Event ID")
-    ap.add_argument("--class-id", type=int, required=True, help="Class ID")
-    ap.add_argument(
-        "--session-type",
-        choices=["Practice", "Qualifying", "Heat", "Prefinal", "Final"],
-        required=True,
-        help="Session type enum value",
-    )
     args = ap.parse_args()
 
-    # Wire up your existing parser and ingestor
     parser = OrbitsParser()
-    ingestor = DBIngestor(SessionLocal, args.event_id, args.class_id, args.session_type)
+    ingestor = DBIngestor(SessionLocal)  # no event/class/session args
 
-    # Start the TCP reader (blocking)
     OrbitsTCPReader(
         host=args.host,
         port=args.port,

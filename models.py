@@ -13,7 +13,7 @@ class Base(DeclarativeBase):
     pass
 
 # --- Enums ---
-SessionTypeEnum = Enum("Practice", "Qualifying", "Heat", "Prefinal", "Final", name="session_type_enum")
+SessionTypeEnum = Enum("Qualifying", "Heat", "Prefinal", name="session_type_enum")
 BasisEnum = Enum("provisional", "official", name="basis_enum")
 ResultStatusEnum = Enum("FINISH", "DNF", "DQ", "DNS", name="result_status_enum")
 PenaltyTypeEnum = Enum("TIME", "POSITION", "DQ", "LAP_INVALID", name="penalty_type_enum")
@@ -24,7 +24,7 @@ class Driver(Base):
     __tablename__ = "drivers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    transponder: Mapped[Optional[str]] = mapped_column(String(64), unique=True) 
+    transponder: Mapped[Optional[str]] = mapped_column(String(64), unique=False, index=True) 
     first_name: Mapped[str] = mapped_column(String(64), nullable=False)
     last_name: Mapped[str] = mapped_column(String(64), nullable=False)
     team: Mapped[Optional[str]] = mapped_column(String(128))   
@@ -118,25 +118,25 @@ class Entry(Base):
 
 class Lap(Base):
     __tablename__ = "laps"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
-    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id", ondelete="CASCADE"), index=True)
-
-    lap_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    lap_time_ms: Mapped[int] = mapped_column(Integer, nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    is_valid: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("1"))
-
-    session: Mapped[Session] = relationship(back_populates="laps")
-    driver: Mapped[Driver] = relationship(back_populates="laps")
-
     __table_args__ = (
         UniqueConstraint('session_id', 'driver_id', 'lap_number', name='uq_session_driver_lap'),
         Index('ix_laps_session_driver_time', 'session_id', 'driver_id', 'lap_time_ms'),
         Index('ix_laps_session_lapno', 'session_id', 'lap_number'),
         Index('ix_laps_session_ts', 'session_id', 'timestamp'),
+        {"sqlite_autoincrement": True},  # ensure AUTOINCREMENT on SQLite
     )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)      # INTEGER PRIMARY KEY
+    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id", ondelete="CASCADE"), index=True)
+
+    lap_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    lap_time_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # <- safer
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_valid: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("1"))
+
+    session: Mapped["Session"] = relationship(back_populates="laps")
+    driver: Mapped["Driver"] = relationship(back_populates="laps")
 
 
 class Penalty(Base):
@@ -146,6 +146,7 @@ class Penalty(Base):
     session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
     driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id", ondelete="CASCADE"), index=True)
     type: Mapped[str] = mapped_column(PenaltyTypeEnum)
+    lap_no: Mapped[Optional[int]] = mapped_column(Integer)
     value_ms: Mapped[Optional[int]] = mapped_column(Integer)
     value_positions: Mapped[Optional[int]] = mapped_column(Integer)
     note: Mapped[Optional[str]] = mapped_column(Text)
