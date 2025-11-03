@@ -207,3 +207,5 @@ __marimo__/
 SUPERNATS-28-POINTS-TRACKER/.gitignore
 .gitignore
 *.db-journal
+
+*.env.vars
