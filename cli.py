@@ -104,6 +104,10 @@ def main():
             args.ui = True
 
         if args.listen:
+            # Mark environment so the UI (running in the same process) knows a listener is already active
+            os.environ["SN28_LISTENER_RUNNING"] = "1"
+            os.environ["SN28_LISTENER_HOST"] = str(args.listen_host)
+            os.environ["SN28_LISTENER_PORT"] = str(args.listen_port)
             t = threading.Thread(target=run_socket_listener, args=(args.listen_host, args.listen_port), daemon=True)
             t.start(); threads.append(t)
             logging.info("Listener thread started on %s:%s", args.listen_host, args.listen_port)

@@ -257,6 +257,13 @@ class PenaltyApp(tk.Tk):
 
         ttk.Label(parent, textvariable=self.listener_status).pack(anchor="w", padx=8)
 
+        # If the listener was started by the CLI launcher in this same process,
+        # reflect that in the status so users don't double-start from the UI.
+        if os.getenv("SN28_LISTENER_RUNNING") == "1":
+            lh = os.getenv("SN28_LISTENER_HOST", self.listen_host_var.get())
+            lp = os.getenv("SN28_LISTENER_PORT", self.listen_port_var.get())
+            self.listener_status.set(f"Listener: running (launcher) on {lh}:{lp}")
+
     # ----- small helper -----
     def _require_session(self) -> Optional[RaceSession]:
         s = self.current_session()
@@ -266,6 +273,14 @@ class PenaltyApp(tk.Tk):
 
     # ----- Listener control -----
     def start_listener(self):
+        # If the launcher already started a listener thread in this process, avoid double-starts.
+        if os.getenv("SN28_LISTENER_RUNNING") == "1":
+            messagebox.showinfo(
+                "Listener",
+                "A listener is already running (started by the launcher).\n\n"
+                "If you want to control it from here, start the UI via 'sn28 ui' or stop the external listener first."
+            )
+            return
         if self._listener_thread and self._listener_thread.is_alive():
             messagebox.showinfo("Listener", "Listener already running.")
             return
@@ -296,14 +311,19 @@ class PenaltyApp(tk.Tk):
 
         def _run():
             try:
-                self.listener_status.set(f"Listener: connecting {host}:{port} ...")
+                # Run the reader loop (blocking) in background thread.
                 reader.run()
             finally:
-                self.listener_status.set("Listener: stopped")
+                # Update UI from the Tk main thread to avoid thread-safety issues.
+                try:
+                    self.after(0, lambda: self.listener_status.set("Listener: stopped"))
+                except Exception:
+                    pass
 
         th = threading.Thread(target=_run, daemon=True)
         th.start()
         self._listener_thread = th
+        # Set status from the UI thread only.
         self.listener_status.set(f"Listener: running on {host}:{port}")
 
     def stop_listener(self):

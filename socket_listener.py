@@ -50,7 +50,7 @@ def lock_session_type(name: str) -> str:
         return "Heat"
     elif "prefinal" in n or "pre-final" in n or "pre final" in n:
         return "Prefinal"
-    elif "final" in n:
+    elif "final" in n or "main" in n or "main event" in n:
         return "Final"
     elif "practice" in n or "happy hour" in n:
         return "Practice"
