@@ -1,0 +1,328 @@
+# sheets_publish.py
+from __future__ import annotations
+from typing import List, Dict, Tuple, Optional
+from datetime import datetime
+import json
+import os
+
+import gspread
+from google.oauth2.service_account import Credentials
+from sqlalchemy import func
+
+from sn28_config import CFG
+from db import SessionLocal
+from models import (
+    Session as RaceSession,
+    Result, Driver, Entry,
+    PointAward, Point, PointScale,
+)
+
+# =========================
+# Google Sheets plumbing
+# =========================
+
+_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def _load_creds() -> Credentials:
+    if CFG.google.service_json_raw:
+        info = json.loads(CFG.google.service_json_raw)
+        return Credentials.from_service_account_info(info, scopes=_SCOPES)
+    if CFG.google.service_json_path and os.path.exists(CFG.google.service_json_path):
+        return Credentials.from_service_account_file(CFG.google.service_json_path, scopes=_SCOPES)
+    raise RuntimeError("Google service account credentials not found. Set GS_SERVICE_JSON_PATH or GS_SERVICE_JSON_RAW.")
+
+def _open_sheet():
+    gc = gspread.authorize(_load_creds())
+    if not CFG.google.spreadsheet_id:
+        raise RuntimeError("Google spreadsheet_id not configured. Set GS_SPREADSHEET_ID.")
+    return gc.open_by_key(CFG.google.spreadsheet_id)
+
+def _safe_ws(sh, title: str, rows: int = 500, cols: int = 16):
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+
+# =========================
+# DB helpers
+# =========================
+
+def _latest_version(db, session_id: int, basis: str) -> Optional[int]:
+    row = (
+        db.query(Result.version)
+          .filter(Result.session_id == session_id, Result.basis == basis)
+          .order_by(Result.version.desc())
+          .first()
+    )
+    return row[0] if row else None
+
+def _get_session(db, session_id: int) -> RaceSession:
+    s = db.get(RaceSession, session_id)
+    if not s:
+        raise RuntimeError(f"Session {session_id} not found")
+    return s
+
+def _ms(ms: Optional[int]) -> str:
+    if ms is None:
+        return ""
+    s = ms / 1000.0
+    if s >= 60:
+        m = int(s // 60)
+        return f"{m}:{(s - 60*m):06.3f}"
+    return f"{s:.3f}"
+
+# =========================
+# Fetchers
+# =========================
+
+def _fetch_official_results(db, session_id: int) -> List[Dict]:
+    v = _latest_version(db, session_id, "official")
+    if v is None:
+        return []
+    sess = _get_session(db, session_id)
+
+    # Preload numbers for (event_id, class_id)
+    num_by_driver: Dict[int, str] = {}
+    for e in (
+        db.query(Entry)
+          .filter(Entry.event_id == sess.event_id, Entry.class_id == sess.class_id)
+          .all()
+    ):
+        num_by_driver[e.driver_id] = e.number or ""
+
+    q = (
+        db.query(Result, Driver)
+          .join(Driver, Driver.id == Result.driver_id)
+          .filter(Result.session_id == session_id,
+                  Result.basis == "official",
+                  Result.version == v)
+          .order_by(Result.position.is_(None), Result.position.asc())
+    )
+    out: List[Dict] = []
+    for r, d in q.all():
+        out.append({
+            "pos": r.position,
+            "number": num_by_driver.get(d.id, ""),
+            "first": d.first_name,
+            "last": d.last_name,
+            "team": d.team or "",
+            "chassis": d.chassis or "",
+            "best_ms": r.best_lap_ms,
+            "last_ms": r.last_lap_ms,
+            "status": r.status_code or "",
+        })
+    return out
+
+def _fetch_heat_points(db, session_id: int) -> List[Dict]:
+    v = _latest_version(db, session_id, "official")
+    if v is None:
+        return []
+    sess = _get_session(db, session_id)
+
+    # Preload numbers for (event_id, class_id)
+    num_by_driver: Dict[int, str] = {}
+    for e in (
+        db.query(Entry)
+          .filter(Entry.event_id == sess.event_id, Entry.class_id == sess.class_id)
+          .all()
+    ):
+        num_by_driver[e.driver_id] = e.number or ""
+
+    qa = (
+        db.query(PointAward, Driver)
+          .join(Driver, Driver.id == PointAward.driver_id)
+          .filter(PointAward.session_id == session_id,
+                  PointAward.basis == "official",
+                  PointAward.version == v)
+          .order_by(PointAward.position.is_(None), PointAward.position.asc())
+    )
+    out: List[Dict] = []
+    for pa, d in qa.all():
+        out.append({
+            "pos": pa.position,
+            "number": num_by_driver.get(d.id, ""),
+            "first": d.first_name,
+            "last": d.last_name,
+            "base": pa.base_points or 0,
+            "bonus": pa.bonus_points or 0,
+            "total": pa.total_points or 0,
+        })
+    return out
+
+# =========================
+# Publishers
+# =========================
+
+def publish_official_results(session_id: int) -> None:
+    if not CFG.app.publish_results:
+        return
+    sh = _open_sheet()
+    ws = _safe_ws(sh, CFG.google.tab_results, rows=1000, cols=16)
+
+    with SessionLocal() as db:
+        sess = _get_session(db, session_id)
+        data = _fetch_official_results(db, session_id)
+
+    header = ["Class", "Session", "Pos", "#", "Driver", "Team", "Chassis", "Best Lap", "Last Lap", "Status", "Updated"]
+    rows = [header]
+    for row in data:
+        rows.append([
+            getattr(sess.race_class, "name", "") if sess else "",
+            f"{sess.session_type} - {sess.session_name or ''}" if sess else "",
+            row["pos"] or "",
+            row["number"],
+            f'{row["first"]} {row["last"]}'.strip(),
+            row["team"],
+            row["chassis"],
+            _ms(row["best_ms"]),
+            _ms(row["last_ms"]),
+            row["status"],
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ])
+
+    ws.clear()
+    if rows:
+        # Use keyword args; ignore type checker complaint about literal string type
+        ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
+def publish_heat_points(session_id: int) -> None:
+    if not CFG.app.publish_points:
+        return
+    sh = _open_sheet()
+    ws = _safe_ws(sh, CFG.google.tab_heat_points, rows=1000, cols=12)
+
+    with SessionLocal() as db:
+        sess = _get_session(db, session_id)
+        data = _fetch_heat_points(db, session_id)
+
+    header = ["Class", "Heat", "Pos", "#", "Driver", "Base", "Bonus", "Total", "Updated"]
+    rows = [header]
+    for row in data:
+        rows.append([
+            getattr(sess.race_class, "name", "") if sess else "",
+            sess.session_name or "",
+            row["pos"] or "",
+            row["number"],
+            f'{row["first"]} {row["last"]}'.strip(),
+            row["base"],
+            row["bonus"],
+            row["total"],
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ])
+
+    ws.clear()
+    if rows:
+        ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
+def publish_prefinal_grid(class_id: int, event_id: int) -> None:
+    """
+    Build Prefinal grid by cumulative official Heat points for (event_id, class_id).
+    Tie-breaker: best official Qualifying position (proxy for 'original qualifying time').
+    """
+    if not CFG.app.publish_prefinal_grid:
+        return
+    sh = _open_sheet()
+    ws = _safe_ws(sh, CFG.google.tab_prefinal_grid, rows=1000, cols=12)
+
+    with SessionLocal() as db:
+        # 1) Heat session IDs
+        heat_ids = [
+            sid for (sid,) in db.query(RaceSession.id)
+                                 .filter(RaceSession.event_id == event_id,
+                                         RaceSession.class_id == class_id,
+                                         RaceSession.session_type == "Heat")
+                                 .all()
+        ]
+        if not heat_ids:
+            ws.clear()
+            ws.update(range_name="A1", values=[["No Heat sessions found for this class/event."]])
+            return
+
+        # 2) For each heat, use latest official PointAwards
+        sub_latest = (
+            db.query(PointAward.session_id, func.max(PointAward.version).label("v"))
+              .filter(PointAward.session_id.in_(heat_ids), PointAward.basis == "official")
+              .group_by(PointAward.session_id)
+              .subquery()
+        )
+
+        qa = (
+            db.query(PointAward, Driver)
+              .join(Driver, Driver.id == PointAward.driver_id)
+              .join(sub_latest, (PointAward.session_id == sub_latest.c.session_id) &
+                               (PointAward.version == sub_latest.c.v))
+              .all()
+        )
+
+        # 3) Aggregate points by driver
+        agg: Dict[int, int] = {}
+        name_by_driver: Dict[int, str] = {}
+        num_by_driver: Dict[int, str] = {}
+        # preload numbers for class/event
+        for e in db.query(Entry).filter(Entry.event_id == event_id,
+                                        Entry.class_id == class_id).all():
+            num_by_driver[e.driver_id] = e.number or ""
+
+        for pa, d in qa:
+            agg[d.id] = agg.get(d.id, 0) + (pa.total_points or 0)
+            name_by_driver[d.id] = f"{d.first_name} {d.last_name}".strip()
+
+        # 4) Qualifying tiebreak: best official qualifying position
+        q_ids = [
+            sid for (sid,) in db.query(RaceSession.id)
+                                 .filter(RaceSession.event_id == event_id,
+                                         RaceSession.class_id == class_id,
+                                         RaceSession.session_type == "Qualifying")
+                                 .all()
+        ]
+        qual_best_pos: Dict[int, int] = {}
+        if q_ids:
+            sub_latest_q = (
+                db.query(Result.session_id, func.max(Result.version).label("v"))
+                  .filter(Result.session_id.in_(q_ids), Result.basis == "official")
+                  .group_by(Result.session_id)
+                  .subquery()
+            )
+            qres = (
+                db.query(Result)
+                  .join(sub_latest_q, (Result.session_id == sub_latest_q.c.session_id) &
+                                     (Result.version == sub_latest_q.c.v))
+                  .filter(Result.position.isnot(None))
+                  .all()
+            )
+            for r in qres:
+                cur = qual_best_pos.get(r.driver_id)
+                if cur is None or (r.position or 10**6) < cur:
+                    qual_best_pos[r.driver_id] = r.position or cur or 10**6
+
+        # 5) Rank: lower points wins; tie -> better qual pos; then name
+        def key_fn(drv_id: int):
+            return (agg.get(drv_id, 10**6),
+                    qual_best_pos.get(drv_id, 10**6),
+                    name_by_driver.get(drv_id, ""))
+
+        ranked = sorted(agg.keys(), key=key_fn)
+
+        # 6) Write rows
+        header = ["Class", "Grid Pos", "#", "Driver", "Total Heat Pts", "Qual Tiebreak", "Updated"]
+        rows = [header]
+        class_name = (db.query(RaceSession)
+                        .filter(RaceSession.class_id == class_id,
+                                RaceSession.event_id == event_id)
+                        .first())
+        class_name = class_name.race_class.name if class_name and class_name.race_class else ""
+
+        for i, drv_id in enumerate(ranked, start=1):
+            rows.append([
+                class_name,
+                str(i),
+                num_by_driver.get(drv_id, ""),
+                name_by_driver.get(drv_id, ""),
+                str(agg.get(drv_id, 0)),
+                str(qual_best_pos.get(drv_id, "")),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ])
+
+    ws.clear()
+    if rows:
+        ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
