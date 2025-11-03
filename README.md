@@ -97,7 +97,10 @@ sn28 api --host 127.0.0.1 --port 5000
 ## Troubleshooting
 
 - Google Sheets: ensure service account has access to the spreadsheet; set `GS_SERVICE_JSON_PATH` or `GS_SERVICE_JSON_RAW`.
-- SQLite file `supernats28.db` is created in the repo root. Delete it to reset, or use SQLite browser to inspect.
+- Database location: the SQLite file now lives in your per‑user data directory.
+  - Windows: `%APPDATA%\SuperNats28\supernats28.db`
+  - Others: `~/.supernats28/supernats28.db`
+  - Override with `SN28_DATA_DIR` to point to a custom folder.
 - If UI shows no sessions, confirm the socket listener is running and Orbits is sending packets.
 
 ## License
