@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supernats28-points"
+version = "0.1.0"
+description = "SuperNats 28 Points Toolkit: ingest Orbits, apply penalties, publish to Sheets"
+authors = [{ name = "Luis" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "Flask>=2.3",
+  "SQLAlchemy>=2.0",
+  "gspread>=5.12",
+  "google-auth>=2.23",
+  "python-dotenv>=1.0",
+]
+
+[project.scripts]
+sn28 = "cli:main"
+sn28-ui = "ui:main"
+sn28-listen = "socket_listener:main"
+sn28-api = "app:main"
+
+[tool.setuptools]
+py-modules = [
+  "app",
+  "sn28_config",
+  "db",
+  "models",
+  "official",
+  "points_config",
+  "sheets_publish",
+  "socket_listener",
+  "ui",
+  "cli",
+]
