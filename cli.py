@@ -38,7 +38,8 @@ def run_ui():
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(prog="sn28", description="SuperNats 28 Points Toolkit")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # Do not require subcommand; we'll default to 'run' with sensible defaults when absent
+    sub = ap.add_subparsers(dest="cmd")
 
     run = sub.add_parser("run", help="Run components")
     run.add_argument("--listen", action="store_true", help="Start Orbits TCP listener")
@@ -49,6 +50,17 @@ def main():
     run.add_argument("--api-host", default=os.getenv("API_HOST", "127.0.0.1"))
     run.add_argument("--api-port", type=int, default=int(os.getenv("API_PORT", "5000")))
 
+    # Convenience subcommands
+    sub.add_parser("ui", help="Launch Penalty Pad UI only")
+
+    listen = sub.add_parser("listen", help="Start Orbits TCP listener only")
+    listen.add_argument("--host", default=os.getenv("ORBITS_HOST", "127.0.0.1"))
+    listen.add_argument("--port", type=int, default=int(os.getenv("ORBITS_PORT", "50000")))
+
+    api = sub.add_parser("api", help="Start Flask API server only")
+    api.add_argument("--host", default=os.getenv("API_HOST", "127.0.0.1"))
+    api.add_argument("--port", type=int, default=int(os.getenv("API_PORT", "5000")))
+
     seed = sub.add_parser("seed", help="Seed points scale")
     seed.add_argument("--field", type=int, default=50)
     seed.add_argument("--bonus-fast-lap", type=int, default=0)
@@ -56,14 +68,40 @@ def main():
 
     args = ap.parse_args()
 
+    # Default behavior: if no subcommand provided, behave like: sn28 run --listen --ui
+    if not getattr(args, "cmd", None):
+        args.cmd = "run"
+        # synthesize attributes used by 'run'
+        args.listen = True
+        args.ui = True
+        args.api = False
+        args.listen_host = os.getenv("ORBITS_HOST", "127.0.0.1")
+        args.listen_port = int(os.getenv("ORBITS_PORT", "50000"))
+        args.api_host = os.getenv("API_HOST", "127.0.0.1")
+        args.api_port = int(os.getenv("API_PORT", "5000"))
+
     if args.cmd == "seed":
         from points_config import seed_skusa_sn28
         seed_skusa_sn28(field_size=args.field, bonus_fast_lap=args.bonus_fast_lap, bonus_pole=args.bonus_pole)
         print("Seeded SKUSA_SN28 scale")
         return
 
+    if args.cmd == "ui":
+        run_ui(); return
+
+    if args.cmd == "listen":
+        run_socket_listener(host=args.host, port=args.port); return
+
+    if args.cmd == "api":
+        run_api(host=args.host, port=args.port); return
+
     if args.cmd == "run":
         threads: list[threading.Thread] = []
+
+        # If user specified 'run' but no components toggled, default to UI + listener
+        if not (args.listen or args.api or args.ui):
+            args.listen = True
+            args.ui = True
 
         if args.listen:
             t = threading.Thread(target=run_socket_listener, args=(args.listen_host, args.listen_port), daemon=True)

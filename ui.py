@@ -1,4 +1,8 @@
 from __future__ import annotations
+import os
+import json
+from pathlib import Path
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import List, Dict, Optional
@@ -26,6 +30,7 @@ from sheets_publish import (
 
 # config.py must define CFG (with points_scheme, publish toggles, etc.)
 from sn28_config import CFG
+from socket_listener import OrbitsParser, DBIngestor, OrbitsTCPReader
 
 init_db()
 
@@ -117,6 +122,13 @@ class PenaltyApp(tk.Tk):
         super().__init__()
         self.title("SuperNats Penalty Pad")
         self.geometry("1150x700")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Listener runtime state
+        self._listener_thread: Optional[threading.Thread] = None
+        self._listener_reader: Optional[OrbitsTCPReader] = None
+        self.listener_status = tk.StringVar(value="Listener: stopped")
+        self._settings: Dict[str, str] = self._load_settings()
 
         # Top: session picker + info + publish
         top = ttk.Frame(self)
@@ -130,9 +142,18 @@ class PenaltyApp(tk.Tk):
         ttk.Button(top, text="Refresh", command=self.refresh_sessions).pack(side="left", padx=4)
         ttk.Button(top, text="Publish Official → Sheets", command=self.publish_official).pack(side="right")
 
-        # Middle: split into three panes
-        mid = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        mid.pack(fill="both", expand=True, padx=8, pady=8)
+        # Notebook hosts Penalties and Listener tabs
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        penalties_tab = ttk.Frame(nb)
+        listener_tab = ttk.Frame(nb)
+        nb.add(penalties_tab, text="Penalties")
+        nb.add(listener_tab, text="Listener")
+
+        # Middle: split into three panes (inside Penalties tab)
+        mid = ttk.PanedWindow(penalties_tab, orient=tk.HORIZONTAL)
+        mid.pack(fill="both", expand=True)
 
         # Left: provisional table
         self.prov_frame = ttk.Frame(mid)
@@ -201,6 +222,9 @@ class PenaltyApp(tk.Tk):
         self.prev_tv.pack(fill="both", expand=True)
         mid.add(self.prev_frame, weight=3)
 
+        # Listener tab content
+        self._build_listener_tab(listener_tab)
+
         # Status bar
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0,6))
@@ -213,12 +237,132 @@ class PenaltyApp(tk.Tk):
         self._sessions: List[RaceSession] = []
         self.refresh_sessions()
 
+    # ----- Listener tab UI -----
+    def _build_listener_tab(self, parent: tk.Widget) -> None:
+        frm = ttk.Frame(parent)
+        frm.pack(fill="x", padx=8, pady=8)
+
+        ttk.Label(frm, text="Orbits Host").grid(row=0, column=0, sticky="w")
+        default_host = self._settings.get("orbits_host") or os.getenv("ORBITS_HOST", "127.0.0.1")
+        self.listen_host_var = tk.StringVar(value=default_host)
+        ttk.Entry(frm, textvariable=self.listen_host_var, width=20).grid(row=0, column=1, padx=6, pady=4)
+
+        ttk.Label(frm, text="Orbits Port").grid(row=0, column=2, sticky="w")
+        default_port = self._settings.get("orbits_port") or os.getenv("ORBITS_PORT", "50000")
+        self.listen_port_var = tk.StringVar(value=str(default_port))
+        ttk.Entry(frm, textvariable=self.listen_port_var, width=10).grid(row=0, column=3, padx=6, pady=4)
+
+        ttk.Button(frm, text="Start Listener", command=self.start_listener).grid(row=0, column=4, padx=8)
+        ttk.Button(frm, text="Stop Listener", command=self.stop_listener).grid(row=0, column=5, padx=4)
+
+        ttk.Label(parent, textvariable=self.listener_status).pack(anchor="w", padx=8)
+
     # ----- small helper -----
     def _require_session(self) -> Optional[RaceSession]:
         s = self.current_session()
         if s is None:
             self.status.set("No session selected.")
         return s
+
+    # ----- Listener control -----
+    def start_listener(self):
+        if self._listener_thread and self._listener_thread.is_alive():
+            messagebox.showinfo("Listener", "Listener already running.")
+            return
+        host = (self.listen_host_var.get() or "127.0.0.1").strip()
+        try:
+            port = int(self.listen_port_var.get() or "50000")
+        except ValueError:
+            messagebox.showerror("Port", "Port must be an integer.")
+            return
+        # save settings immediately on start
+        try:
+            self._save_settings(host, str(port))
+        except Exception:
+            pass
+
+        parser = OrbitsParser()
+        ingestor = DBIngestor(SessionLocal)
+        reader = OrbitsTCPReader(
+            host=host,
+            port=port,
+            parser=parser,
+            ingestor=ingestor,
+            connect_timeout=5.0,
+            read_timeout=5.0,
+            max_backoff=10.0,
+        )
+        self._listener_reader = reader
+
+        def _run():
+            try:
+                self.listener_status.set(f"Listener: connecting {host}:{port} ...")
+                reader.run()
+            finally:
+                self.listener_status.set("Listener: stopped")
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        self._listener_thread = th
+        self.listener_status.set(f"Listener: running on {host}:{port}")
+
+    def stop_listener(self):
+        if self._listener_reader:
+            try:
+                self._listener_reader.stop()
+            except Exception:
+                pass
+        if self._listener_thread:
+            try:
+                self._listener_thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self._listener_thread = None
+        self._listener_reader = None
+        self.listener_status.set("Listener: stopped")
+
+    def on_close(self):
+        try:
+            # persist latest settings
+            try:
+                self._save_settings(self.listen_host_var.get(), self.listen_port_var.get())
+            except Exception:
+                pass
+            self.stop_listener()
+        except Exception:
+            pass
+        self.destroy()
+
+    # ----- Settings persistence -----
+    def _settings_file(self) -> Path:
+        base = os.getenv("APPDATA")
+        if base:
+            base_path = Path(base) / "SuperNats28"
+        else:
+            base_path = Path.home() / ".supernats28"
+        base_path.mkdir(parents=True, exist_ok=True)
+        return base_path / "settings.json"
+
+    def _load_settings(self) -> Dict[str, str]:
+        try:
+            p = self._settings_file()
+            if p.exists():
+                with p.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return {k: str(v) for k, v in data.items()}
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self, host: str, port: str) -> None:
+        data = {
+            "orbits_host": (host or "127.0.0.1").strip(),
+            "orbits_port": (port or "50000").strip(),
+        }
+        p = self._settings_file()
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
     # ----- UI actions -----
     def refresh_sessions(self):

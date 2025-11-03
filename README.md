@@ -72,7 +72,11 @@ python ui.py
 With the package installed, you can run multiple components together:
 
 ```powershell
-# Start Listener + UI
+# Double-click the EXE or run without args to start Listener + UI by default
+# (uses ORBITS_HOST/ORBITS_PORT env if set)
+sn28
+
+# Explicit: Start Listener + UI
 sn28 run --listen --ui --listen-host 127.0.0.1 --listen-port 50000
 
 # Start API server only
@@ -80,6 +84,11 @@ sn28 run --api --api-host 127.0.0.1 --api-port 5000
 
 # Seed SKUSA points scale
 sn28 seed --field 50
+
+# Convenience subcommands
+sn28 ui
+sn28 listen --host 127.0.0.1 --port 50000
+sn28 api --host 127.0.0.1 --port 5000
 ```
 
 - Official result versions: each publish creates `basis=official, version=N`. Heat points are written using the SAME version for consistency.
