@@ -13,7 +13,7 @@ class Base(DeclarativeBase):
     pass
 
 # --- Enums ---
-SessionTypeEnum = Enum("Qualifying", "Heat", "Prefinal", name="session_type_enum")
+SessionTypeEnum = Enum("Practice", "Qualifying", "Heat", "Prefinal","Final", name="session_type_enum")
 BasisEnum = Enum("provisional", "official", name="basis_enum")
 ResultStatusEnum = Enum("FINISH", "DNF", "DQ", "DNS", name="result_status_enum")
 PenaltyTypeEnum = Enum("TIME", "POSITION", "DQ", "LAP_INVALID", name="penalty_type_enum")

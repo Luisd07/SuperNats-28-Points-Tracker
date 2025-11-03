@@ -1,4 +1,6 @@
+# socket_listener.py
 import argparse
+import logging
 import csv
 from datetime import datetime, timezone, date
 import socket
@@ -6,15 +8,15 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
-from sqlalchemy import func  # for seeding last saved lap_no
+from sqlalchemy import func
 
 from db import SessionLocal, init_db
 from models import (
     Base, Driver, Event, RaceClass, Session as RaceSession, Entry, Lap, Result,
-    BasisEnum, SessionTypeEnum
+    BasisEnum, SessionTypeEnum, Penalty
 )
 
-# --- Helpers ---------------------------------------------------------------
+# ---------------------- Helpers ----------------------
 
 def parseTimeSTR(s: str) -> Optional[float]:
     s = (s or "").strip().strip('"')
@@ -37,14 +39,6 @@ def csvFields(line: str) -> List[str]:
     reader = csv.reader([line.rstrip("\r\n")], delimiter=',', quotechar='"', skipinitialspace=False)
     return next(reader)
 
-def fmt(sec: Optional[float]) -> str:
-    if sec is None:
-        return ""
-    if sec >= 60:
-        m = int(sec // 60); s = sec - 60 * m
-        return f"{m}:{s:06.3f}"
-    return f"{sec:.3f}"
-
 def to_ms(seconds: Optional[float]) -> Optional[int]:
     return int(round(seconds * 1000)) if seconds is not None else None
 
@@ -55,14 +49,16 @@ def lock_session_type(name: str) -> str:
     if "heat" in n:
         return "Heat"
     elif "prefinal" in n or "pre-final" in n or "pre final" in n:
-        return "Prefinal"  # match enum spelling
+        return "Prefinal"
     elif "final" in n:
         return "Final"
     elif "practice" in n or "happy hour" in n:
         return "Practice"
     return ""
 
-# --- State containers ------------------------------------------------------
+CHECKERED_STRINGS = {"checkered", "chequered", "finish", "finished", "chequer", "check"}
+
+# ---------------------- State ----------------------
 
 @dataclass
 class DriverState:
@@ -79,18 +75,20 @@ class TimingState:
     session_name: str = ""
     session_type: str = ""
     class_name: str = ""
-    event_name: str = ""            # <- captured from $E when available
+    event_name: str = ""            # from $E if present
     track_name: str = ""
     track_length: Optional[float] = None
     flag: str = ""
+
+    # live timing
     last_lap: Dict[str, Optional[float]] = field(default_factory=dict)  # seconds
     best_lap: Dict[str, Optional[float]] = field(default_factory=dict)  # seconds
-    lap_no: Dict[str, int] = field(default_factory=dict)  # per-driver lap number
-    order: List[str] = field(default_factory=list)  
+    lap_no: Dict[str, int] = field(default_factory=dict)                # feed lap number per kart
+    order: List[str] = field(default_factory=list)                      # running order by number
+
     drivers: Dict[str, DriverState] = field(default_factory=dict)
 
-
-# --- Parser ---------------------------------------------------------------
+# ---------------------- Parser ----------------------
 
 class OrbitsParser:
     def __init__(self):
@@ -126,14 +124,15 @@ class OrbitsParser:
                 except:
                     pass
             elif key in {"MEETING", "EVENT", "EVENTNAME", "TITLE"}:
-                self.s.event_name = val  # capture event/meeting name if present
+                self.s.event_name = val
 
         elif tag == "$A":
+            # $A,"48","48",12807698,"James","Overbeck","Coyote",1
             number = f[1].strip('"')
             if not number:
                 return
             d = self.s.drivers.get(number, DriverState(number))
-            d.transponder = f[2].strip('"') if len(f) > 2 else d.transponder
+            d.transponder = f[3].strip('"') if len(f) > 3 else d.transponder
             d.first   = f[4].strip('"') if len(f) > 4 else d.first
             d.last    = f[5].strip('"') if len(f) > 5 else d.last
             d.chassis = f[6].strip('"') if len(f) > 6 else d.chassis
@@ -145,6 +144,7 @@ class OrbitsParser:
             self.s.drivers[number] = d
 
         elif tag == "$COMP":
+            # $COMP,"48","48",12807698,"James","Overbeck","Coyote","TeamName"
             number = f[1].strip('"')
             if not number:
                 return
@@ -156,8 +156,9 @@ class OrbitsParser:
             self.s.drivers[number] = d
 
         elif tag == "$F":
+            # $F,9999,"00:01:16","16:45:26","00:06:43","Green "
             if len(f) > 5:
-                self.s.flag = f[5].strip('"').strip()
+                self.s.flag = (f[5] or "").strip().strip('"').strip()
 
         elif tag == "$G" and len(f) >= 5:
             # $G,<position>,"<number>",<lap_no>,"<last_lap>"
@@ -166,7 +167,6 @@ class OrbitsParser:
                 pos = int(f[1])
             except:
                 return
-            # capture lap_no
             try:
                 lap_no = int(f[3])
                 self.s.lap_no[number] = max(lap_no, self.s.lap_no.get(number, 0))
@@ -186,7 +186,6 @@ class OrbitsParser:
                 self.s.order.pop()
 
         elif tag == "$H" and len(f) >= 5:
-            # $H,<pos>,"<number>",?, "<last>"
             number = f[2].strip('"')
             lap = parseTimeSTR(f[4])
             if lap is not None:
@@ -219,46 +218,96 @@ class OrbitsParser:
                 cur = self.s.best_lap.get(number)
                 self.s.best_lap[number] = min(best, cur) if cur is not None else best
 
-
-# --- DB ingest ------------------------------------------------------------
+# ---------------------- DB ingest ----------------------
 
 class DBIngestor:
     def __init__(self, SessionLocal):
         self.SessionLocal = SessionLocal
-        self.lap_counter: Dict[str, int] = {}     # not used for lap numbering anymore
         self.saved_lap_no: Dict[str, int] = {}    # number -> last persisted lap_no
+        self.current_event_id: Optional[int] = None
+        self.current_class_id: Optional[int] = None
+        self._last_session_id: Optional[int] = None
 
-    # ----- Event/Class/Session resolution from packets -----
+    # ---- Event/Class: placeholder then rename/merge ----
 
     def _event_name_or_default(self, s: TimingState) -> str:
         if s.event_name:
-            return s.event_name
-        base = s.track_name or "Auto Event"
+            return s.event_name.strip()
+        base = (s.track_name or "Auto Event").strip()
         return f"{base} {date.today().isoformat()}"
 
     def get_or_create_event(self, db: Session, s: TimingState) -> Event:
-        name = self._event_name_or_default(s)
-        ev = db.query(Event).filter(Event.name == name).one_or_none()
-        if not ev:
-            ev = Event(
-                name=name,
-                start_date=date.today(),
-                end_date=date.today(),
-                location=s.track_name or None,
-            )
-            db.add(ev); db.flush()
+        if self.current_event_id:
+            ev = db.get(Event, self.current_event_id)
+            if ev:
+                target = (s.event_name or "").strip()
+                if target and ev.name != target:
+                    existing = db.query(Event).filter(Event.name == target).one_or_none()
+                    if existing and existing.id != ev.id:
+                        # merge
+                        db.query(RaceClass).filter_by(event_id=ev.id).update({"event_id": existing.id})
+                        db.query(RaceSession).filter_by(event_id=ev.id).update({"event_id": existing.id})
+                        db.query(Entry).filter_by(event_id=ev.id).update({"event_id": existing.id})
+                        db.flush()
+                        db.delete(ev); db.flush()
+                        self.current_event_id = existing.id
+                        return existing
+                    else:
+                        ev.name = target
+                        if s.track_name: ev.location = s.track_name
+                        db.flush()
+                return ev
+
+        # no cached event; try by final name if present
+        name = (s.event_name or "").strip()
+        if name:
+            ev = db.query(Event).filter(Event.name == name).one_or_none()
+            if not ev:
+                ev = Event(name=name, start_date=date.today(), end_date=date.today(), location=s.track_name or None)
+                db.add(ev); db.flush()
+        else:
+            placeholder = self._event_name_or_default(s)
+            ev = db.query(Event).filter(Event.name == placeholder).one_or_none()
+            if not ev:
+                ev = Event(name=placeholder, start_date=date.today(), end_date=date.today(), location=s.track_name or None)
+                db.add(ev); db.flush()
+
+        self.current_event_id = ev.id
         return ev
 
     def get_or_create_class(self, db: Session, event_id: int, class_name: str) -> RaceClass:
-        cname = class_name or "Unknown Class"
+        if self.current_class_id:
+            rc = db.get(RaceClass, self.current_class_id)
+            if rc:
+                target = (class_name or "").strip()
+                if target and rc.name != target:
+                    existing = db.query(RaceClass).filter(
+                        RaceClass.event_id == event_id, RaceClass.name == target
+                    ).one_or_none()
+                    if existing and existing.id != rc.id:
+                        # merge
+                        db.query(RaceSession).filter_by(class_id=rc.id).update({"class_id": existing.id})
+                        db.query(Entry).filter_by(class_id=rc.id).update({"class_id": existing.id})
+                        db.flush()
+                        db.delete(rc); db.flush()
+                        self.current_class_id = existing.id
+                        return existing
+                    else:
+                        rc.name = target
+                        db.flush()
+                return rc
+
+        name = (class_name or "").strip() or "Unknown Class"
         rc = db.query(RaceClass).filter(
-            RaceClass.event_id == event_id,
-            RaceClass.name == cname
+            RaceClass.event_id == event_id, RaceClass.name == name
         ).one_or_none()
         if not rc:
-            rc = RaceClass(event_id=event_id, name=cname)
+            rc = RaceClass(event_id=event_id, name=name)
             db.add(rc); db.flush()
+        self.current_class_id = rc.id
         return rc
+
+    # ---- Session ----
 
     def get_or_create_session(self, db: Session, event_id: int, class_id: int,
                               session_name: str, session_type: str) -> RaceSession:
@@ -278,16 +327,15 @@ class DBIngestor:
             )
             db.add(sess); db.flush()
         else:
-            # Sync session type if we later infer it
             if session_type and sess.session_type != session_type:
                 sess.session_type = session_type
                 db.flush()
+        self._last_session_id = sess.id
         return sess
 
-    # ----- Existing helpers (lightly adapted) -----
+    # ---- Entities ----
 
     def _last_saved_lap(self, db: Session, session_id: int, driver_id: int, number: str) -> int:
-        """Seed/return the last saved lap_no for this driver in this session."""
         if number in self.saved_lap_no:
             return self.saved_lap_no[number]
         max_no = db.query(func.max(Lap.lap_number)).filter(
@@ -299,10 +347,7 @@ class DBIngestor:
     def get_or_create_driver(self, db: Session, number: str, driver_state: DriverState) -> Driver:
         driver = (
             db.query(Driver)
-            .filter(
-                getattr(Driver, "first_name") == driver_state.first,
-                getattr(Driver, "last_name") == driver_state.last,
-            )
+            .filter(Driver.first_name == driver_state.first, Driver.last_name == driver_state.last)
             .first()
         )
         if not driver:
@@ -311,6 +356,7 @@ class DBIngestor:
                 last_name=driver_state.last,
                 team=driver_state.team,
                 chassis=driver_state.chassis,
+                transponder=driver_state.transponder or None
             )
             db.add(driver)
             db.flush()
@@ -324,46 +370,56 @@ class DBIngestor:
                 driver.team = driver_state.team; changed = True
             if driver_state.chassis and driver.chassis != driver_state.chassis:
                 driver.chassis = driver_state.chassis; changed = True
+            if driver_state.transponder and driver.transponder != driver_state.transponder:
+                driver.transponder = driver_state.transponder; changed = True
             if changed:
                 db.flush()
         return driver
 
-    def get_or_create_entry(self, db: Session, drv: Driver, number: str, event_id: int, class_id: int) -> Entry:
-        ent = (
-            db.query(Entry)
-            .filter(
-                Entry.event_id == event_id,
-                Entry.class_id == class_id,
-                Entry.number == number,
-            )
-            .first()
-        )
+    def get_or_create_entry(self, db: Session, drv: Driver, number: str,
+                            event_id: int, class_id: int, driver_state: Optional[DriverState]) -> Entry:
+        ent = db.query(Entry).filter(
+            Entry.event_id == event_id,
+            Entry.class_id == class_id,
+            Entry.number == number,
+        ).one_or_none()
+
+        want_team = (driver_state.team if driver_state and driver_state.team else drv.team)
+        want_chas = (driver_state.chassis if driver_state and driver_state.chassis else drv.chassis)
+        want_trans = (driver_state.transponder if driver_state and driver_state.transponder else None)
+
         if not ent:
             ent = Entry(
                 event_id=event_id,
                 class_id=class_id,
                 driver_id=drv.id,
                 number=number,
-                transponder=None,
+                transponder=want_trans,
+                team=want_team,
+                chassis=want_chas,
             )
-            db.add(ent)
-            db.flush()
-        elif ent.driver_id != drv.id:
-            ent.driver_id = drv.id
-            db.flush()
+            db.add(ent); db.flush()
+        else:
+            changed = False
+            if ent.driver_id != drv.id:
+                ent.driver_id = drv.id; changed = True
+            if want_team and ent.team != want_team:
+                ent.team = want_team; changed = True
+            if want_chas and ent.chassis != want_chas:
+                ent.chassis = want_chas; changed = True
+            if want_trans and ent.transponder != want_trans:
+                ent.transponder = want_trans; changed = True
+            if changed:
+                db.flush()
         return ent
 
     def get_or_create_result(self, db: Session, session_id: int, driver_id: int) -> Result:
-        res = (
-            db.query(Result)
-            .filter(
-                Result.session_id == session_id,
-                Result.driver_id == driver_id,
-                Result.basis == "provisional",
-                Result.version == 1,
-            )
-            .first()
-        )
+        res = db.query(Result).filter(
+            Result.session_id == session_id,
+            Result.driver_id == driver_id,
+            Result.basis == "provisional",
+            Result.version == 1,
+        ).one_or_none()
         if not res:
             res = Result(
                 session_id=session_id,
@@ -371,74 +427,38 @@ class DBIngestor:
                 basis="provisional",
                 version=1,
             )
-            db.add(res)
-            db.flush()
+            db.add(res); db.flush()
         return res
+
+    # ---- Apply one parser tick ----
 
     def apply(self, parsed: OrbitsParser):
         s = parsed.s
         with self.SessionLocal() as db_session:
-            # Resolve Event, Class, Session from packets
+            # 1) Resolve Event, Class, Session from packets (rename/merge safe)
             ev = self.get_or_create_event(db_session, s)
             rc = self.get_or_create_class(db_session, ev.id, s.class_name)
             sess = self.get_or_create_session(db_session, ev.id, rc.id, s.session_name, s.session_type)
 
-            # Drivers + Entries map
+            # 2) Ensure Drivers + Entries exist; build num->driver_id map
             num_to_driver_id: Dict[str, int] = {}
             for number, driver_state in s.drivers.items():
                 drv = self.get_or_create_driver(db_session, number, driver_state)
-                self.get_or_create_entry(db_session, drv, number, ev.id, rc.id)
+                self.get_or_create_entry(db_session, drv, number, ev.id, rc.id, driver_state)
                 num_to_driver_id[number] = drv.id
 
-            # Leader best lap
-            ordered_nums = [c for c in s.order if c and c in num_to_driver_id]
-            leader_best_ms: Optional[int] = None
-            for c in ordered_nums:
-                b_sec = s.best_lap.get(c)
-                if b_sec is not None:
-                    leader_best_ms = to_ms(b_sec)
-                    break
-
-            # Upsert results (provisional)
-            for idx, number in enumerate(ordered_nums, start=1):
-                driver_id = num_to_driver_id[number]
-                result = self.get_or_create_result(db_session, sess.id, driver_id)
-
-                last_sec = s.last_lap.get(number)
-                best_sec = s.best_lap.get(number)
-
-                last_ms = to_ms(last_sec)
-                best_ms = to_ms(best_sec)
-
-                result.position = idx
-                result.last_lap_ms = last_ms
-
-                if best_ms is not None and (result.best_lap_ms is None or best_ms < result.best_lap_ms):
-                    result.best_lap_ms = best_ms
-
-                if leader_best_ms is not None and result.best_lap_ms is not None:
-                    gap = result.best_lap_ms - leader_best_ms
-                    result.gap_to_p1_ms = gap if gap >= 0 else 0
-                else:
-                    result.gap_to_p1_ms = None
-
-            # Persist laps only when feed lap_no increases and we have a last-lap time
+            # 3) Persist laps only when feed lap_no increases and we have a last-lap time
             for number, feed_lap_no in s.lap_no.items():
                 if number not in num_to_driver_id:
                     continue
                 driver_id = num_to_driver_id[number]
                 last_saved = self._last_saved_lap(db_session, sess.id, driver_id, number)
-
                 if feed_lap_no <= last_saved:
                     continue
-
                 last_sec = s.last_lap.get(number)
                 last_ms = to_ms(last_sec) if last_sec is not None else None
                 if last_ms is None:
-                    # wait until we receive the last-lap time
                     continue
-
-                # If the feed jumped more than one, backfill sequentially with same time
                 for ln in range(last_saved + 1, feed_lap_no + 1):
                     db_session.add(
                         Lap(
@@ -452,10 +472,66 @@ class DBIngestor:
                     )
                 self.saved_lap_no[number] = feed_lap_no
 
+            # 4) Upsert results per session type
+            # Build "ordered" list and "best laps" map
+            ordered_nums = [c for c in s.order if c and c in num_to_driver_id]
+            best_map_ms: Dict[str, int] = {}
+            for num, sec in s.best_lap.items():
+                if sec is not None:
+                    best_map_ms[num] = to_ms(sec)  # type: ignore
+
+            # Global fastest best lap for gap (P/Q)
+            fastest_best_ms = min(best_map_ms.values()) if best_map_ms else None
+
+            def upsert(num: str, position: Optional[int]):
+                driver_id = num_to_driver_id[num]
+                result = self.get_or_create_result(db_session, sess.id, driver_id)
+
+                last_ms = to_ms(s.last_lap.get(num))
+                best_ms = best_map_ms.get(num)
+
+                result.position = position
+                result.last_lap_ms = last_ms
+
+                if best_ms is not None and (result.best_lap_ms is None or best_ms < result.best_lap_ms):
+                    result.best_lap_ms = best_ms
+
+                if sess.session_type in ("Practice", "Qualifying"):
+                    if fastest_best_ms is not None and result.best_lap_ms is not None:
+                        result.gap_to_p1_ms = max(0, result.best_lap_ms - fastest_best_ms)
+                    else:
+                        result.gap_to_p1_ms = None
+                else:
+                    # race gap requires pass times/total time; leave None for now
+                    result.gap_to_p1_ms = None
+
+            if sess.session_type in ("Practice", "Qualifying"):
+                # rank by best lap ascending; if none, push to bottom; tie-break by current order index
+                # build candidates
+                candidates = list(num_to_driver_id.keys())
+                # stable index from current order for tie-break
+                idx_in_order = {n: (ordered_nums.index(n) if n in ordered_nums else 10**6) for n in candidates}
+                def key_fn(n: str):
+                    bm = best_map_ms.get(n)
+                    return (bm is None, bm if bm is not None else 10**12, idx_in_order[n], n)
+                ranked = sorted(candidates, key=key_fn)
+                pos = 1
+                for n in ranked:
+                    # assign a position only if the driver has a best lap
+                    assign_pos = pos if best_map_ms.get(n) is not None else None
+                    upsert(n, assign_pos)
+                    if assign_pos is not None:
+                        pos += 1
+            else:
+                # Heat / Prefinal / Final => position by running order
+                for idx, number in enumerate(ordered_nums, start=1):
+                    upsert(number, idx)
+
             db_session.commit()
 
+# ---------------------- TCP Reader ----------------------
+
 class OrbitsTCPReader:
-   
     def __init__(
         self,
         host: str,
@@ -479,7 +555,7 @@ class OrbitsTCPReader:
         self._stop = True
 
     def run(self):
-        import socket, time
+        import time
         backoff = 1.0
         while not self._stop:
             sock = None
@@ -500,6 +576,19 @@ class OrbitsTCPReader:
                     self.parser.parseLine(line)
                     self.ingestor.apply(self.parser)
 
+                    # Optional: flip to provisional on checker (if you want it here)
+                    flag = (self.parser.s.flag or "").strip().lower()
+                    if flag in CHECKERED_STRINGS:
+                        sid = getattr(self.ingestor, "_last_session_id", None)
+                        if sid:
+                            with SessionLocal() as db:
+                                sess = db.get(RaceSession, sid)
+                                if sess and sess.status != "provisional":
+                                    sess.status = "provisional"
+                                    if not sess.ended_at:
+                                        sess.ended_at = datetime.now(timezone.utc)
+                                    db.commit()
+
             except (socket.timeout, ConnectionError, OSError):
                 time.sleep(backoff)
                 backoff = min(self.max_backoff, backoff * 2)
@@ -513,7 +602,10 @@ class OrbitsTCPReader:
                 except Exception:
                     pass
 
-if __name__ == "__main__":
+# ---------------------- Main ----------------------
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     init_db()
 
     ap = argparse.ArgumentParser(description="Orbits TCP -> Parser -> DB ingestor")
@@ -522,8 +614,9 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     parser = OrbitsParser()
-    ingestor = DBIngestor(SessionLocal)  # no event/class/session args
+    ingestor = DBIngestor(SessionLocal)  # zero-arg IDs; resolved from packets
 
+    logging.info("Starting Orbits TCP reader on %s:%s", args.host, args.port)
     OrbitsTCPReader(
         host=args.host,
         port=args.port,
@@ -533,3 +626,7 @@ if __name__ == "__main__":
         read_timeout=5.0,
         max_backoff=10.0,
     ).run()
+
+
+if __name__ == "__main__":
+    main()
