@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
   push:
     tags:
-      - "v0.1.0"
+      - "v*"
 
 permissions:
   contents: write
@@ -28,22 +28,24 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build single-file EXE with PyInstaller
+      - name: Build single-file EXE with PyInstaller (tag-aware name)
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile --name sn28 cli.py
+          $version = "$env:GITHUB_REF_NAME"
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "dev" }
+          pyinstaller --noconfirm --onefile --name "sn28-$version" cli.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sn28-windows-exe
-          path: dist/sn28.exe
+          name: sn28-windows-exe-${{ github.ref_name }}
+          path: dist/sn28-*.exe
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/sn28.exe
+            dist/sn28-*.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
