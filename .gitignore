@@ -219,3 +219,6 @@ test_raw_publish.py
 test_sheets.py
 /debug
 debug/
+.env.template
+DEPLOYMENT.md
+launch_sn28.bat

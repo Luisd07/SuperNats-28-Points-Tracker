@@ -1,11 +1,26 @@
 from __future__ import annotations
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+
+# Determine the directory where the executable/script is located
+if getattr(sys, 'frozen', False):
+    # Running as compiled executable
+    APP_DIR = Path(sys.executable).parent
+else:
+    # Running as script
+    APP_DIR = Path(__file__).parent
 
 # Optional: load a .env file if present (no hard dependency)
 try:
     from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
+    # Look for .env next to the executable/script
+    env_path = APP_DIR / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+    else:
+        load_dotenv()  # Try current directory as fallback
 except Exception:
     pass
 

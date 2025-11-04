@@ -236,17 +236,24 @@ def write_official_and_award_points(db: Session, session_id: int, scheme_name: s
     sess.status = "official"
     sess.ended_at = sess.ended_at or func.now()
 
-    # 5) award heat points if applicable
-    if sess.session_type == "Heat":
-        _award_points_for_heat(db, sess, preview, scheme_name, next_ver)
+    # 5) award points if applicable
+    # Qualifying always awards according to qualifying scale.
+    # Any session whose name contains "Heat" (case-insensitive) OR type == "Heat" awards heat points.
+    sname = (sess.session_name or "")
+    is_heat_by_name = ("heat" in sname.lower())
+    if sess.session_type == "Qualifying":
+        _award_points_for_session(db, sess, preview, scheme_name, next_ver, award_type="Qualifying")
+    elif is_heat_by_name or sess.session_type == "Heat":
+        _award_points_for_session(db, sess, preview, scheme_name, next_ver, award_type="Heat")
 
     db.commit()
 
-def _award_points_for_heat(db: Session, sess: RaceSession, preview: List[ResultView], scheme_name: str, version: int) -> None:
+def _award_points_for_session(db: Session, sess: RaceSession, preview: List[ResultView], scheme_name: str, version: int, award_type: str) -> None:
     """
-    Simple point awarder:
-      - Look up a Point row by name (scheme_name), then its PointScale entries for session_type.
+    General point awarder for Heat or Qualifying:
+      - Look up a Point row by name (scheme_name), then its PointScale entries for the given award_type.
       - Assign base points by finisher position; ignore bonus here.
+      - Note: Qualifying scales are stored as integers (1..N) to fit schema; when publishing, we can render as 0.01..N*0.01.
     """
     # find the point scheme
     pt = (
@@ -261,7 +268,7 @@ def _award_points_for_heat(db: Session, sess: RaceSession, preview: List[ResultV
     scales = (
         db.query(PointScale)
           .filter(PointScale.point_id == pt.id,
-                  PointScale.session_type == sess.session_type)
+                  PointScale.session_type == award_type)
           .all()
     )
     pos_to_pts = {sc.position: sc.points for sc in scales}

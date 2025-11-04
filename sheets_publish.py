@@ -458,6 +458,106 @@ def publish_raw_heat_points(session_id: int) -> None:
 
     _publish_rows(sh, "Raw_HeatPoints", header, rows)
 
+def publish_raw_points(session_id: int) -> None:
+    """
+    Publish latest OFFICIAL points (Heat or Qualifying) for a session into Raw_Points.
+    Qualifying points are stored as integers in DB (1..N); render as fractional (0.01..N*0.01) in the sheet.
+    """
+    if not CFG.app.publish_points:
+        return
+
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        sess = _get_session(db, session_id)
+        data = _fetch_heat_points(db, session_id)  # uses PointAward table; works for Heat or Qualifying awards
+
+        class_name = getattr(sess.race_class, "name", "") if sess else ""
+        ver = _latest_version(db, session_id, "official") or 0
+        now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        header = [
+            "EventID","ClassID","Class","SessionID","SessionType","SessionName","Version","Basis",
+            "DriverID","Pos","Number","First","Last","Base","Bonus","Total","UpdatedUTC"
+        ]
+
+        # Determine whether to render fractional points (Qualifying)
+        s_type = getattr(sess, "session_type", "") if sess else ""
+        s_name = (getattr(sess, "session_name", "") or "") if sess else ""
+        is_heat = (s_type == "Heat") or ("heat" in s_name.lower())
+        is_qual = (s_type == "Qualifying")
+
+        rows: List[List[Any]] = []
+        for row in data:
+            driver_id = row.get("driver_id") if "driver_id" in row else None
+            base = row["base"]
+            bonus = row["bonus"]
+            total = row["total"]
+            # Render qualifying as fractional hundredths for Sheets display
+            if is_qual:
+                base = float(base) / 100.0 if base is not None else 0.0
+                bonus = float(bonus) / 100.0 if bonus is not None else 0.0
+                total = float(total) / 100.0 if total is not None else 0.0
+
+            rows.append([
+                sess.event_id if sess else None,
+                sess.class_id if sess else None,
+                class_name,
+                sess.id if sess else None,
+                s_type,
+                (sess.session_name or "") if sess else "",
+                ver,
+                "official",
+                driver_id,
+                row["pos"],
+                row["number"],
+                row["first"],
+                row["last"],
+                base,
+                bonus,
+                total,
+                now_utc,
+            ])
+
+    _publish_rows(sh, "Raw_Points", header, rows)
+
+def ensure_heat_points_class_views(event_id: int) -> None:
+    """
+    Ensure per-class Heat points view tabs exist: HeatPoints_<ClassName>.
+    These are Sheets tabs with FILTER formulas over Raw_Points, showing rows for the class
+    and where SessionType == 'Heat' OR SessionName contains 'Heat'.
+    """
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        # Get all classes for this event
+        classes = db.query(RaceSession.class_id, RaceSession.event_id).filter(RaceSession.event_id == event_id).distinct().all()
+        # Map class_id -> name
+        names: Dict[int, str] = {}
+        for cid, _ in classes:
+            rc = db.query(RaceSession).filter(RaceSession.class_id == cid, RaceSession.event_id == event_id).first()
+            if rc and rc.race_class and rc.race_class.name:
+                names[cid] = rc.race_class.name
+
+    def sanitize_title(title: str) -> str:
+        bad = ":/\\?*[]"
+        out = "".join(ch for ch in title if ch not in bad)
+        return out[:95]
+
+    for _, cname in names.items():
+        tab = f"HeatPoints_{sanitize_title(cname)}"
+        ws = _safe_ws(sh, tab, rows=1000, cols=18)
+        # Header (match Raw_Points)
+        header = [
+            "EventID","ClassID","Class","SessionID","SessionType","SessionName","Version","Basis",
+            "DriverID","Pos","Number","First","Last","Base","Bonus","Total","UpdatedUTC"
+        ]
+        # FILTER rows by Class (col C) and Heat by SessionType (col E) or SessionName (col F)
+        # Use USER_ENTERED for formulas
+        formula = (
+            f"=FILTER('Raw_Points'!A2:Q, ('Raw_Points'!C:C=\"{cname}\") * ( (REGEXMATCH('Raw_Points'!F:F, \"Heat\")) + ('Raw_Points'!E:E=\"Heat\") ))"
+        )
+        ws.clear()
+        ws.update(range_name="A1", values=[header, [formula]], value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
 def publish_raw_prefinal_grid(class_id: int, event_id: int) -> None:
     """
     Publish normalized prefinal grid to Raw_PrefinalGrid.

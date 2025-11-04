@@ -25,7 +25,8 @@ from official import compute_official_order, write_official_and_award_points
 #   - publish_heat_points(session_id) or publish_raw_heat_points(session_id)
 #   - publish_prefinal_grid(class_id, event_id) or publish_raw_prefinal_grid(class_id, event_id)
 from sheets_publish import (
-    publish_raw_results, publish_raw_heat_points, publish_raw_prefinal_grid
+    publish_raw_results, publish_raw_heat_points, publish_raw_prefinal_grid,
+    publish_raw_points, ensure_heat_points_class_views,
 )
 
 # config.py must define CFG (with points_scheme, publish toggles, etc.)
@@ -646,9 +647,16 @@ class PenaltyApp(tk.Tk):
             if CFG.app.publish_results:
                 publish_raw_results(sid)
                 msg_parts.append("results")
-            if getattr(sess, "session_type", "") == "Heat" and CFG.app.publish_points:
-                publish_raw_heat_points(sid)
-                msg_parts.append("heat points")
+            if CFG.app.publish_points:
+                # unified points publisher (handles Heat by name and Qualifying)
+                publish_raw_points(sid)
+                msg_parts.append("points")
+                # Ensure class-separated Heat views are present for this event
+                try:
+                    ensure_heat_points_class_views(sess.event_id)
+                except Exception:
+                    # Non-fatal if view creation fails
+                    pass
 
             # Optional: publish prefinal grid when ready (usually after all heats):
             # publish_raw_prefinal_grid(sess.class_id, sess.event_id)

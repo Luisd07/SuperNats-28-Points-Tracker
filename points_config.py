@@ -15,12 +15,16 @@ def build_skusa_heat_scale(field_size: int = 120) -> Dict[int, int]:
         scale[pos] = pos  # 2->2, 3->3, 4->4, ...
     return scale
 
-# SKUSA SuperNats qualifying scoring: fractional points for tiebreaker
-# 0.01 (P1), 0.02 (P2), 0.03 (P3), ..., 1.20 (P120)
-def build_skusa_qualifying_scale(field_size: int = 120) -> Dict[int, float]:
-    scale: Dict[int, float] = {}
+"""
+Qualifying scale note:
+We store Qualifying points as integers 1..N in the DB (PointScale.points is int).
+When publishing to Sheets, we render these as fractional hundredths (divide by 100),
+so P1 displays as 0.01, P2 as 0.02, ..., P120 as 1.20.
+"""
+def build_skusa_qualifying_scale(field_size: int = 120) -> Dict[int, int]:
+    scale: Dict[int, int] = {}
     for pos in range(1, field_size + 1):
-        scale[pos] = pos * 0.01  # 1->0.01, 2->0.02, ..., 120->1.20
+        scale[pos] = pos  # stored as 1..N; rendered as 0.01..N*0.01 in Sheets
     return scale
 
 def seed_skusa_sn28(field_size: int = 120, bonus_fast_lap: int = 0, bonus_pole: int = 0) -> None:
