@@ -41,6 +41,7 @@ class AppCfg:
     publish_results: bool
     publish_points: bool
     publish_prefinal_grid: bool
+    publish_raw_tabs: bool
 
 
 @dataclass
@@ -70,6 +71,7 @@ def load_config() -> Config:
             publish_results=(os.getenv("PUBLISH_RESULTS", "1") == "1") and sheets_ready,
             publish_points=(os.getenv("PUBLISH_POINTS", "1") == "1") and sheets_ready,
             publish_prefinal_grid=(os.getenv("PUBLISH_PREFINAL_GRID", "1") == "1") and sheets_ready,
+            publish_raw_tabs=(os.getenv("PUBLISH_RAW_TABS", "0") == "1") and sheets_ready,
         ),
     )
 

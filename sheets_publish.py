@@ -558,6 +558,268 @@ def ensure_heat_points_class_views(event_id: int) -> None:
         ws.clear()
         ws.update(range_name="A1", values=[header, [formula]], value_input_option="USER_ENTERED")  # type: ignore[arg-type]
 
+def ensure_simple_views(event_id: int) -> None:
+    """
+    Create/update compact dynamic view tabs to avoid per-class proliferation:
+      - HeatPoints_View: Filter Raw_Points by class in B1 and Heat sessions.
+      - HeatTotals_View: Filter Raw_HeatTotals by class in B1.
+      - LCQ_View: Filter Raw_HeatTotals by class in B1 and Rank > cutoff in B2.
+    """
+    sh = _open_sheet()
+
+    # HeatPoints_View
+    ws_hp = _safe_ws(sh, "HeatPoints_View", rows=1000, cols=18)
+    hp_header = [
+        "EventID","ClassID","Class","SessionID","SessionType","SessionName","Version","Basis",
+        "DriverID","Pos","Number","First","Last","Base","Bonus","Total","UpdatedUTC"
+    ]
+    hp_top = [["Class Filter", ""], hp_header]
+    hp_formula = (
+        "=FILTER('Raw_Points'!A2:Q, ('Raw_Points'!C:C=$B$1) * ((REGEXMATCH('Raw_Points'!F:F, \"Heat\")) + ('Raw_Points'!E:E=\"Heat\")))"
+    )
+    ws_hp.clear()
+    ws_hp.update(range_name="A1", values=hp_top + [[hp_formula]], value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
+    # HeatTotals_View
+    ws_ht = _safe_ws(sh, "HeatTotals_View", rows=1000, cols=12)
+    ht_header = ["EventID","ClassID","Class","DriverID","Number","Driver","TotalHeatPts","QualTiebreak","Rank","UpdatedUTC"]
+    ht_top = [["Class Filter", ""], ht_header]
+    ht_formula = "=FILTER('Raw_HeatTotals'!A2:J, 'Raw_HeatTotals'!C:C=$B$1)"
+    ws_ht.clear()
+    ws_ht.update(range_name="A1", values=ht_top + [[ht_formula]], value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
+    # LCQ_View
+    ws_lcq = _safe_ws(sh, "LCQ_View", rows=1000, cols=12)
+    lcq_header = ht_header
+    lcq_top = [["Class Filter", ""], ["Cutoff Rank", "28"], lcq_header]
+    lcq_formula = "=FILTER('Raw_HeatTotals'!A2:J, ('Raw_HeatTotals'!C:C=$B$1) * ('Raw_HeatTotals'!I:I>$B$2))"
+    ws_lcq.clear()
+    ws_lcq.update(range_name="A1", values=lcq_top + [[lcq_formula]], value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
+# =========================
+# Class-focused single-tab publishers (simple outputs)
+# =========================
+def publish_class_results_view(session_id: int) -> None:
+    """
+    Publish latest OFFICIAL results for the session into a single tab 'Class_Results'.
+    Intended for Heat/Qualifying sessions. Overwrites the tab each time.
+    """
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        sess = _get_session(db, session_id)
+        data = _fetch_official_results(db, session_id)
+
+        header = ["Class", "Session", "Pos", "#", "Driver", "Team", "Chassis", "Best Lap", "Last Lap", "Status", "Updated"]
+        rows: List[List[Any]] = []
+
+        if sess.session_type not in ("Heat", "Qualifying"):
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows = [[f"Session '{sess.session_type}' is not Heat/Qualifying", now]]
+        else:
+            for row in data:
+                rows.append([
+                    getattr(sess.race_class, "name", "") if sess else "",
+                    f"{sess.session_type} - {sess.session_name or ''}" if sess else "",
+                    row.get("pos") or "",
+                    row.get("number", ""),
+                    f"{row.get('first','')} {row.get('last','')}".strip(),
+                    row.get("team", ""),
+                    row.get("chassis", ""),
+                    _ms(row.get("best_ms")),
+                    _ms(row.get("last_ms")),
+                    row.get("status", ""),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ])
+
+    _publish_rows(sh, "Class_Results", header, rows)
+
+def publish_class_heat_totals_view(class_id: int, event_id: int) -> None:
+    """
+    Publish cumulative totals for the class into 'Class_HeatTotals'.
+    Totals = sum(Heat points) + sum(Qualifying points). Qualifying displayed as fractional (x/100).
+    Overwrites the tab each time.
+    """
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        # Heat sessions
+        heat_ids = [sid for (sid,) in db.query(RaceSession.id)
+                                .filter(RaceSession.event_id == event_id,
+                                        RaceSession.class_id == class_id,
+                                        RaceSession.session_type == "Heat").all()]
+        # Qual sessions
+        qual_ids = [sid for (sid,) in db.query(RaceSession.id)
+                                .filter(RaceSession.event_id == event_id,
+                                        RaceSession.class_id == class_id,
+                                        RaceSession.session_type == "Qualifying").all()]
+
+        # Map number and names
+        num_by_driver: Dict[int, str] = {}
+        for e in db.query(Entry).filter(Entry.event_id == event_id, Entry.class_id == class_id).all():
+            num_by_driver[e.driver_id] = e.number or ""
+
+        class_name = (db.query(RaceSession)
+                        .filter(RaceSession.class_id == class_id, RaceSession.event_id == event_id)
+                        .first())
+        class_name = class_name.race_class.name if class_name and class_name.race_class else ""
+
+        # Latest official awards for Heat
+        heat_pts: Dict[int, int] = {}
+        if heat_ids:
+            sub_latest_h = (
+                db.query(PointAward.session_id, func.max(PointAward.version).label("v"))
+                  .filter(PointAward.session_id.in_(heat_ids), PointAward.basis == "official")
+                  .group_by(PointAward.session_id)
+                  .subquery()
+            )
+            for pa in db.query(PointAward).join(sub_latest_h, (PointAward.session_id == sub_latest_h.c.session_id) & (PointAward.version == sub_latest_h.c.v)).all():
+                heat_pts[pa.driver_id] = heat_pts.get(pa.driver_id, 0) + (pa.total_points or 0)
+
+        # Latest official awards for Qualifying
+        qual_pts: Dict[int, int] = {}
+        if qual_ids:
+            sub_latest_q = (
+                db.query(PointAward.session_id, func.max(PointAward.version).label("v"))
+                  .filter(PointAward.session_id.in_(qual_ids), PointAward.basis == "official")
+                  .group_by(PointAward.session_id)
+                  .subquery()
+            )
+            for pa in db.query(PointAward).join(sub_latest_q, (PointAward.session_id == sub_latest_q.c.session_id) & (PointAward.version == sub_latest_q.c.v)).all():
+                qual_pts[pa.driver_id] = qual_pts.get(pa.driver_id, 0) + (pa.total_points or 0)
+
+        # Qualifying best position tiebreak as backup
+        qual_best_pos: Dict[int, int] = {}
+        if qual_ids:
+            sub_latest_qr = (
+                db.query(Result.session_id, func.max(Result.version).label("v"))
+                  .filter(Result.session_id.in_(qual_ids), Result.basis == "official")
+                  .group_by(Result.session_id)
+                  .subquery()
+            )
+            for r in db.query(Result).join(sub_latest_qr, (Result.session_id == sub_latest_qr.c.session_id) & (Result.version == sub_latest_qr.c.v)).filter(Result.position.isnot(None)).all():
+                cur = qual_best_pos.get(r.driver_id)
+                if cur is None or (r.position or 10**6) < cur:
+                    qual_best_pos[r.driver_id] = r.position or cur or 10**6
+
+        # Aggregate
+        drivers = set(heat_pts.keys()) | set(qual_pts.keys())
+        def key_fn(did: int):
+            # total used for ranking; qual as tiebreaker; then number as stable
+            return (
+                (heat_pts.get(did, 0) + (qual_pts.get(did, 0) / 100.0)),
+                qual_best_pos.get(did, 10**6),
+                num_by_driver.get(did, "")
+            )
+        ranked = sorted(drivers, key=key_fn)
+
+        header = ["Class","Rank","#","Driver","HeatPts","QualPts","TotalPts","QualTiebreak","Updated"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows: List[List[Any]] = []
+        for i, did in enumerate(ranked, start=1):
+            # fetch driver name
+            drow = db.get(Driver, did)
+            name = f"{getattr(drow, 'first_name', '')} {getattr(drow, 'last_name', '')}".strip() if drow else ""
+            h = heat_pts.get(did, 0)
+            q = qual_pts.get(did, 0) / 100.0
+            rows.append([
+                class_name,
+                i,
+                num_by_driver.get(did, ""),
+                name,
+                h,
+                q,
+                h + q,
+                qual_best_pos.get(did, ""),
+                now,
+            ])
+
+    _publish_rows(sh, "Class_HeatTotals", header, rows)
+
+def publish_class_prefinal_view(class_id: int, event_id: int) -> None:
+    """
+    Build Prefinal grid for the class/event and write to 'Class_Prefinal'.
+    Uses cumulative Heat points with Qualifying tiebreak (same as Raw_PrefinalGrid).
+    """
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        # Reuse Raw_PrefinalGrid logic to compute ordering
+        # Heat session IDs
+        heat_ids = [sid for (sid,) in db.query(RaceSession.id)
+                               .filter(RaceSession.event_id == event_id,
+                                       RaceSession.class_id == class_id,
+                                       RaceSession.session_type == "Heat").all()]
+        if not heat_ids:
+            _publish_rows(sh, "Class_Prefinal",
+                          ["Class","Grid Pos","#","Driver","Total Heat Pts","Qual Tiebreak","Updated"],
+                          [["", "No Heat sessions found for this class/event.", "", "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")]])
+            return
+
+        sub_latest = (
+            db.query(PointAward.session_id, func.max(PointAward.version).label("v"))
+              .filter(PointAward.session_id.in_(heat_ids), PointAward.basis == "official")
+              .group_by(PointAward.session_id)
+              .subquery()
+        )
+        qa = (
+            db.query(PointAward, Driver)
+              .join(Driver, Driver.id == PointAward.driver_id)
+              .join(sub_latest, (PointAward.session_id == sub_latest.c.session_id) & (PointAward.version == sub_latest.c.v))
+              .all()
+        )
+        agg: Dict[int, int] = {}
+        name_by_driver: Dict[int, str] = {}
+        num_by_driver: Dict[int, str] = {}
+        for e in db.query(Entry).filter(Entry.event_id == event_id, Entry.class_id == class_id).all():
+            num_by_driver[e.driver_id] = e.number or ""
+        for pa, d in qa:
+            agg[d.id] = agg.get(d.id, 0) + (pa.total_points or 0)
+            name_by_driver[d.id] = f"{d.first_name} {d.last_name}".strip()
+
+        # Qualifying tiebreak: best official qualifying position
+        q_ids = [sid for (sid,) in db.query(RaceSession.id)
+                               .filter(RaceSession.event_id == event_id,
+                                       RaceSession.class_id == class_id,
+                                       RaceSession.session_type == "Qualifying").all()]
+        qual_best_pos: Dict[int, int] = {}
+        if q_ids:
+            sub_latest_q = (db.query(Result.session_id, func.max(Result.version).label("v"))
+                              .filter(Result.session_id.in_(q_ids), Result.basis == "official")
+                              .group_by(Result.session_id)
+                              .subquery())
+            for r in (db.query(Result)
+                        .join(sub_latest_q, (Result.session_id == sub_latest_q.c.session_id) & (Result.version == sub_latest_q.c.v))
+                        .filter(Result.position.isnot(None)).all()):
+                cur = qual_best_pos.get(r.driver_id)
+                if cur is None or (r.position or 10**6) < cur:
+                    qual_best_pos[r.driver_id] = r.position or cur or 10**6
+
+        def key_fn(drv_id: int):
+            return (agg.get(drv_id, 10**6),
+                    qual_best_pos.get(drv_id, 10**6),
+                    name_by_driver.get(drv_id, ""))
+        ranked = sorted(agg.keys(), key=key_fn)
+
+        # Class name
+        cls = (db.query(RaceSession)
+                 .filter(RaceSession.class_id == class_id, RaceSession.event_id == event_id)
+                 .first())
+        class_name = cls.race_class.name if cls and cls.race_class else ""
+
+        header = ["Class","Grid Pos","#","Driver","Total Heat Pts","Qual Tiebreak","Updated"]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows: List[List[Any]] = []
+        for i, did in enumerate(ranked, start=1):
+            rows.append([
+                class_name,
+                i,
+                num_by_driver.get(did, ""),
+                name_by_driver.get(did, ""),
+                agg.get(did, 0),
+                qual_best_pos.get(did, ""),
+                now,
+            ])
+
+    _publish_rows(sh, "Class_Prefinal", header, rows)
+
 def publish_raw_prefinal_grid(class_id: int, event_id: int) -> None:
     """
     Publish normalized prefinal grid to Raw_PrefinalGrid.
