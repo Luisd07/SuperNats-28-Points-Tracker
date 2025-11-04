@@ -142,6 +142,8 @@ class PenaltyApp(tk.Tk):
 
         ttk.Button(top, text="Refresh", command=self.refresh_sessions).pack(side="left", padx=4)
         ttk.Button(top, text="Publish Official → Sheets", command=self.publish_official).pack(side="right")
+        ttk.Button(top, text="Publish Heat Totals (Class)", command=self.publish_heat_totals_for_class).pack(side="right", padx=(0,6))
+        ttk.Button(top, text="Publish Prefinal Grid (Class)", command=self.publish_prefinal_for_class).pack(side="right", padx=(0,6))
 
         # Notebook hosts Penalties and Listener tabs
         nb = ttk.Notebook(self)
@@ -651,6 +653,14 @@ class PenaltyApp(tk.Tk):
                 # unified points publisher (handles Heat by name and Qualifying)
                 publish_raw_points(sid)
                 msg_parts.append("points")
+                # For backward compatibility, also publish legacy Raw_HeatPoints for Heat sessions
+                try:
+                    sname = (getattr(sess, "session_name", "") or "")
+                    if getattr(sess, "session_type", "") == "Heat" or ("heat" in sname.lower()):
+                        publish_raw_heat_points(sid)
+                        msg_parts.append("heat points")
+                except Exception:
+                    pass
                 # Ensure class-separated Heat views are present for this event
                 try:
                     ensure_heat_points_class_views(sess.event_id)
@@ -668,6 +678,46 @@ class PenaltyApp(tk.Tk):
         except Exception as e:
             import traceback
             messagebox.showerror("Error", f"Publish failed:\n{e}\n\n{traceback.format_exc()}")
+
+    def publish_heat_totals_for_class(self):
+        sess = self._require_session()
+        if not sess:
+            messagebox.showwarning("No session", "Select a session first.")
+            return
+        if not CFG.google.spreadsheet_id:
+            messagebox.showerror("Config Error", "Google Sheets not configured! Set GS_SPREADSHEET_ID.")
+            return
+        if not (CFG.google.service_json_path or CFG.google.service_json_raw):
+            messagebox.showerror("Config Error", "Google service account not configured! Set GS_SERVICE_JSON_PATH or GS_SERVICE_JSON_RAW.")
+            return
+        try:
+            from sheets_publish import publish_raw_heat_totals, ensure_heat_totals_class_views
+            publish_raw_heat_totals(sess.class_id, sess.event_id)
+            ensure_heat_totals_class_views(sess.event_id)
+            messagebox.showinfo("Published", "Heat totals published and class views updated.")
+            self.status.set("Heat totals published for class.")
+        except Exception as e:
+            import traceback
+            messagebox.showerror("Error", f"Publish Heat Totals failed:\n{e}\n\n{traceback.format_exc()}")
+
+    def publish_prefinal_for_class(self):
+        sess = self._require_session()
+        if not sess:
+            messagebox.showwarning("No session", "Select a session first.")
+            return
+        if not CFG.google.spreadsheet_id:
+            messagebox.showerror("Config Error", "Google Sheets not configured! Set GS_SPREADSHEET_ID.")
+            return
+        if not (CFG.google.service_json_path or CFG.google.service_json_raw):
+            messagebox.showerror("Config Error", "Google service account not configured! Set GS_SERVICE_JSON_PATH or GS_SERVICE_JSON_RAW.")
+            return
+        try:
+            publish_raw_prefinal_grid(sess.class_id, sess.event_id)
+            messagebox.showinfo("Published", "Prefinal grid published for this class.")
+            self.status.set("Prefinal grid published for class.")
+        except Exception as e:
+            import traceback
+            messagebox.showerror("Error", f"Publish Prefinal Grid failed:\n{e}\n\n{traceback.format_exc()}")
 
 if __name__ == "__main__":
     app = PenaltyApp()

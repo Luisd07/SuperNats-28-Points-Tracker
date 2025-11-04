@@ -661,3 +661,144 @@ def publish_raw_prefinal_grid(class_id: int, event_id: int) -> None:
             ])
 
     _publish_rows(sh, "Raw_PrefinalGrid", header, rows)
+
+def publish_raw_heat_totals(class_id: int, event_id: int) -> None:
+    """
+    Publish cumulative Heat points standings per class/event into Raw_HeatTotals.
+    Tie-breaker: best official Qualifying position (lower is better).
+    Includes Rank for convenience.
+    """
+    if not CFG.app.publish_prefinal_grid and not CFG.app.publish_points:
+        # If either toggle is off, we still allow totals when points are being used.
+        pass
+
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        # Heat session IDs
+        heat_ids = [
+            sid for (sid,) in db.query(RaceSession.id)
+                                 .filter(RaceSession.event_id == event_id,
+                                         RaceSession.class_id == class_id,
+                                         RaceSession.session_type == "Heat")
+                                 .all()
+        ]
+        if not heat_ids:
+            _publish_rows(sh, "Raw_HeatTotals",
+                          ["EventID","ClassID","Class","DriverID","Number","Driver","TotalHeatPts","QualTiebreak","Rank","UpdatedUTC"],
+                          [[event_id, class_id, "No Heat sessions found for this class/event.", "", "", "", "", "", "", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")]])
+            return
+
+        sub_latest = (
+            db.query(PointAward.session_id, func.max(PointAward.version).label("v"))
+              .filter(PointAward.session_id.in_(heat_ids), PointAward.basis == "official")
+              .group_by(PointAward.session_id)
+              .subquery()
+        )
+
+        qa = (
+            db.query(PointAward, Driver)
+              .join(Driver, Driver.id == PointAward.driver_id)
+              .join(sub_latest, (PointAward.session_id == sub_latest.c.session_id) &
+                               (PointAward.version == sub_latest.c.v))
+              .all()
+        )
+
+        agg: Dict[int, int] = {}
+        name_by_driver: Dict[int, str] = {}
+        num_by_driver: Dict[int, str] = {}
+        for e in db.query(Entry).filter(Entry.event_id == event_id,
+                                        Entry.class_id == class_id).all():
+            num_by_driver[e.driver_id] = e.number or ""
+
+        for pa, d in qa:
+            agg[d.id] = agg.get(d.id, 0) + (pa.total_points or 0)
+            name_by_driver[d.id] = f"{d.first_name} {d.last_name}".strip()
+
+        # Qualifying tiebreak: best official qualifying position
+        q_ids = [
+            sid for (sid,) in db.query(RaceSession.id)
+                                 .filter(RaceSession.event_id == event_id,
+                                         RaceSession.class_id == class_id,
+                                         RaceSession.session_type == "Qualifying")
+                                 .all()
+        ]
+        qual_best_pos: Dict[int, int] = {}
+        if q_ids:
+            sub_latest_q = (
+                db.query(Result.session_id, func.max(Result.version).label("v"))
+                  .filter(Result.session_id.in_(q_ids), Result.basis == "official")
+                  .group_by(Result.session_id)
+                  .subquery()
+            )
+            qres = (
+                db.query(Result)
+                  .join(sub_latest_q, (Result.session_id == sub_latest_q.c.session_id) &
+                                     (Result.version == sub_latest_q.c.v))
+                  .filter(Result.position.isnot(None))
+                  .all()
+            )
+            for r in qres:
+                cur = qual_best_pos.get(r.driver_id)
+                if cur is None or (r.position or 10**6) < cur:
+                    qual_best_pos[r.driver_id] = r.position or cur or 10**6
+
+        def key_fn(drv_id: int):
+            return (agg.get(drv_id, 10**6),
+                    qual_best_pos.get(drv_id, 10**6),
+                    name_by_driver.get(drv_id, ""))
+
+        ranked = sorted(agg.keys(), key=key_fn)
+
+        class_name = (db.query(RaceSession)
+                        .filter(RaceSession.class_id == class_id,
+                                RaceSession.event_id == event_id)
+                        .first())
+        class_name = class_name.race_class.name if class_name and class_name.race_class else ""
+
+        header = ["EventID","ClassID","Class","DriverID","Number","Driver","TotalHeatPts","QualTiebreak","Rank","UpdatedUTC"]
+        now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        rows: List[List[Any]] = []
+        for i, drv_id in enumerate(ranked, start=1):
+            rows.append([
+                event_id, class_id, class_name,
+                drv_id,
+                num_by_driver.get(drv_id, ""),
+                name_by_driver.get(drv_id, ""),
+                agg.get(drv_id, 0),
+                qual_best_pos.get(drv_id, ""),
+                i,
+                now_utc
+            ])
+
+    _publish_rows(sh, "Raw_HeatTotals", header, rows)
+
+def ensure_heat_totals_class_views(event_id: int) -> None:
+    """
+    Create/update HeatTotals_<ClassName> tabs that show cumulative Heat totals for that class
+    by filtering Raw_HeatTotals.
+    """
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        # All classes for the event
+        classes = db.query(RaceSession.class_id, RaceSession.event_id).filter(RaceSession.event_id == event_id).distinct().all()
+        names: Dict[int, str] = {}
+        for cid, _ in classes:
+            rc = db.query(RaceSession).filter(RaceSession.class_id == cid, RaceSession.event_id == event_id).first()
+            if rc and rc.race_class and rc.race_class.name:
+                names[cid] = rc.race_class.name
+
+    def sanitize_title(title: str) -> str:
+        bad = ":/\\?*[]"
+        out = "".join(ch for ch in title if ch not in bad)
+        return out[:95]
+
+    for _, cname in names.items():
+        tab = f"HeatTotals_{sanitize_title(cname)}"
+        ws = _safe_ws(sh, tab, rows=1000, cols=12)
+        header = ["EventID","ClassID","Class","DriverID","Number","Driver","TotalHeatPts","QualTiebreak","Rank","UpdatedUTC"]
+        formula = (
+            f"=FILTER('Raw_HeatTotals'!A2:J, 'Raw_HeatTotals'!C:C=\"{cname}\")"
+        )
+        ws.clear()
+        ws.update(range_name="A1", values=[header, [formula]], value_input_option="USER_ENTERED")  # type: ignore[arg-type]

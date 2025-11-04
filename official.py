@@ -262,7 +262,21 @@ def _award_points_for_session(db: Session, sess: RaceSession, preview: List[Resu
           .first()
     )
     if not pt:
-        return
+        # Lazy-seed default scheme if missing (first run on a fresh machine)
+        try:
+            from points_config import seed_skusa_sn28  # local import to avoid cycles
+            seed_skusa_sn28()
+            db.flush()
+        except Exception:
+            pass
+        pt = (
+            db.query(Point)
+              .filter(Point.name == scheme_name)
+              .first()
+        )
+        if not pt:
+            # Still missing: abort awarding silently
+            return
 
     # build a map position->points for this session type
     scales = (
