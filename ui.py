@@ -21,11 +21,11 @@ from models import (
 from official import compute_official_order, write_official_and_award_points
 
 # sheets_publish.py should expose:
-#   - publish_official_results(session_id)
-#   - publish_heat_points(session_id)
-#   - publish_prefinal_grid(class_id, event_id)
+#   - publish_official_results(session_id) or publish_raw_results(session_id)
+#   - publish_heat_points(session_id) or publish_raw_heat_points(session_id)
+#   - publish_prefinal_grid(class_id, event_id) or publish_raw_prefinal_grid(class_id, event_id)
 from sheets_publish import (
-    publish_official_results, publish_heat_points, publish_prefinal_grid
+    publish_raw_results, publish_raw_heat_points, publish_raw_prefinal_grid
 )
 
 # config.py must define CFG (with points_scheme, publish toggles, etc.)
@@ -622,24 +622,44 @@ class PenaltyApp(tk.Tk):
             messagebox.showwarning("No session", "Select a session first.")
             return
         sid = sess.id
+        
+        # Check if Google Sheets is configured
+        if not CFG.google.spreadsheet_id:
+            messagebox.showerror("Config Error", 
+                "Google Sheets not configured!\n\n"
+                "Set GS_SPREADSHEET_ID in .env file or environment variables.")
+            return
+        
+        if not (CFG.google.service_json_path or CFG.google.service_json_raw):
+            messagebox.showerror("Config Error", 
+                "Google service account not configured!\n\n"
+                "Set GS_SERVICE_JSON_PATH in .env file or environment variables.")
+            return
+        
         try:
             # Write official results + award points (transaction inside)
             with SessionLocal() as db:
                 write_official_and_award_points(db, sid, scheme_name=CFG.app.points_scheme)
 
             # Push to Sheets (guard with CFG publishing toggles if you like)
-            publish_official_results(sid)
-            if getattr(sess, "session_type", "") == "Heat":
-                publish_heat_points(sid)
+            msg_parts = []
+            if CFG.app.publish_results:
+                publish_raw_results(sid)
+                msg_parts.append("results")
+            if getattr(sess, "session_type", "") == "Heat" and CFG.app.publish_points:
+                publish_raw_heat_points(sid)
+                msg_parts.append("heat points")
 
             # Optional: publish prefinal grid when ready (usually after all heats):
-            # publish_prefinal_grid(sess.class_id, sess.event_id)
+            # publish_raw_prefinal_grid(sess.class_id, sess.event_id)
 
             self.refresh_all()
-            messagebox.showinfo("Published", "Official results written and pushed to Sheets.")
-            self.status.set("Published official + pushed to Sheets.")
+            published = " and ".join(msg_parts) if msg_parts else "nothing (all toggles off)"
+            messagebox.showinfo("Published", f"Official {published} pushed to Sheets.")
+            self.status.set(f"Published official + pushed {published} to Sheets.")
         except Exception as e:
-            messagebox.showerror("Error", f"Publish failed:\n{e}")
+            import traceback
+            messagebox.showerror("Error", f"Publish failed:\n{e}\n\n{traceback.format_exc()}")
 
 if __name__ == "__main__":
     app = PenaltyApp()

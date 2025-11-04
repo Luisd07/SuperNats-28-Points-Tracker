@@ -285,8 +285,20 @@ class DBIngestor:
                         RaceClass.event_id == event_id, RaceClass.name == target
                     ).one_or_none()
                     if existing and existing.id != rc.id:
-                        # merge
-                        db.query(RaceSession).filter_by(class_id=rc.id).update({"class_id": existing.id})
+                        # merge, but avoid UNIQUE constraint violation on sessions
+                        # For each session with class_id=rc.id, check if a session with same event_id, session_name exists for existing.id
+                        sessions_to_update = db.query(RaceSession).filter_by(class_id=rc.id).all()
+                        for sess in sessions_to_update:
+                            duplicate = db.query(RaceSession).filter_by(
+                                event_id=sess.event_id,
+                                class_id=existing.id,
+                                session_name=sess.session_name
+                            ).first()
+                            if not duplicate:
+                                sess.class_id = existing.id
+                            else:
+                                # Optionally, handle merging or deleting duplicate sessions
+                                db.delete(sess)
                         db.query(Entry).filter_by(class_id=rc.id).update({"class_id": existing.id})
                         db.flush()
                         db.delete(rc); db.flush()

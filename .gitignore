@@ -207,5 +207,15 @@ __marimo__/
 SUPERNATS-28-POINTS-TRACKER/.gitignore
 .gitignore
 *.db-journal
-
+/service_account.json
 *.env.vars
+*json
+debug_fetch.py
+debug_publish_flow.py
+debug_tag.py
+check_data.py
+test_publish.py
+test_raw_publish.py
+test_sheets.py
+/debug
+debug/

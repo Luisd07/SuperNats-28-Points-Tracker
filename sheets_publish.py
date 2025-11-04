@@ -1,6 +1,6 @@
 # sheets_publish.py
 from __future__ import annotations
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from datetime import datetime
 import json
 import os
@@ -42,6 +42,40 @@ def _safe_ws(sh, title: str, rows: int = 500, cols: int = 16):
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
+
+# =========================
+# SHEETS HELPER: single fast write
+# =========================
+def _publish_rows(sh, tab_title: str, header: List[str], rows: List[List[Any]]) -> None:
+    """
+    Writes header + rows to a 'Raw_' tab in a single batch_update.
+    Ensures the sheet exists and is sized to fit the data. Overwrites A1:... block only.
+    """
+    ws = _safe_ws(sh, tab_title, rows=max(1000, len(rows) + 10), cols=max(16, len(header) + 4))
+
+    # Compute write range based on header length and row count
+    total_rows = 1 + len(rows)
+    total_cols = max(len(header), max((len(r) for r in rows), default=0))
+    import gspread
+    end_col_letter = gspread.utils.rowcol_to_a1(1, total_cols).split('1')[0]  # e.g. 'S' from 'S1'
+    # Include sheet title in range to target the correct worksheet
+    write_range = f"'{tab_title}'!A1:{end_col_letter}{total_rows}"
+
+    values = [header] + rows
+
+    body = {
+        "valueInputOption": "RAW",
+        "data": [
+            {
+                "range": write_range,
+                "values": values,
+            }
+        ]
+    }
+
+    # Clear only the previous used area (to avoid old tail data showing)
+    ws.clear()
+    ws.spreadsheet.values_batch_update(body)
 
 # =========================
 # DB helpers
@@ -101,6 +135,7 @@ def _fetch_official_results(db, session_id: int) -> List[Dict]:
     out: List[Dict] = []
     for r, d in q.all():
         out.append({
+            "driver_id": d.id,
             "pos": r.position,
             "number": num_by_driver.get(d.id, ""),
             "first": d.first_name,
@@ -139,6 +174,7 @@ def _fetch_heat_points(db, session_id: int) -> List[Dict]:
     out: List[Dict] = []
     for pa, d in qa.all():
         out.append({
+            "driver_id": d.id,
             "pos": pa.position,
             "number": num_by_driver.get(d.id, ""),
             "first": d.first_name,
@@ -326,3 +362,202 @@ def publish_prefinal_grid(class_id: int, event_id: int) -> None:
     ws.clear()
     if rows:
         ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
+# =========================
+# Raw publishers for normalized Google Sheets tabs
+# =========================
+def publish_raw_results(session_id: int) -> None:
+    """
+    Publish latest OFFICIAL results for a session into Raw_Results
+    with numeric ms fields for best/last.
+    """
+    if not CFG.app.publish_results:
+        return
+
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        sess = _get_session(db, session_id)
+        data = _fetch_official_results(db, session_id)
+
+        class_name = getattr(sess.race_class, "name", "") if sess else ""
+        header = [
+            "EventID","ClassID","Class","SessionID","SessionType","SessionName",
+            "Version","Basis","DriverID","Pos","Number","First","Last","Team","Chassis",
+            "BestMs","LastMs","Status","UpdatedUTC"
+        ]
+
+        ver = _latest_version(db, session_id, "official") or 0
+        now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        rows: List[List[Any]] = []
+        for row in data:
+            driver_id = row.get("driver_id") if "driver_id" in row else None
+            rows.append([
+                sess.event_id if sess else None,
+                sess.class_id if sess else None,
+                class_name,
+                sess.id if sess else None,
+                sess.session_type if sess else "",
+                (sess.session_name or "") if sess else "",
+                ver,
+                "official",
+                driver_id,
+                row["pos"],
+                row["number"],
+                row["first"],
+                row["last"],
+                row["team"],
+                row["chassis"],
+                row["best_ms"],
+                row["last_ms"],
+                row["status"],
+                now_utc,
+            ])
+
+    _publish_rows(sh, "Raw_Results", header, rows)
+
+def publish_raw_heat_points(session_id: int) -> None:
+    if not CFG.app.publish_points:
+        return
+
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        sess = _get_session(db, session_id)
+        data = _fetch_heat_points(db, session_id)
+
+        class_name = getattr(sess.race_class, "name", "") if sess else ""
+        ver = _latest_version(db, session_id, "official") or 0
+        now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        header = [
+            "EventID","ClassID","Class","SessionID","SessionName","Version","Basis",
+            "DriverID","Pos","Number","First","Last","Base","Bonus","Total","UpdatedUTC"
+        ]
+
+        rows: List[List[Any]] = []
+        for row in data:
+            driver_id = row.get("driver_id") if "driver_id" in row else None
+            rows.append([
+                sess.event_id if sess else None,
+                sess.class_id if sess else None,
+                class_name,
+                sess.id if sess else None,
+                (sess.session_name or "") if sess else "",
+                ver,
+                "official",
+                driver_id,
+                row["pos"],
+                row["number"],
+                row["first"],
+                row["last"],
+                row["base"],
+                row["bonus"],
+                row["total"],
+                now_utc,
+            ])
+
+    _publish_rows(sh, "Raw_HeatPoints", header, rows)
+
+def publish_raw_prefinal_grid(class_id: int, event_id: int) -> None:
+    """
+    Publish normalized prefinal grid to Raw_PrefinalGrid.
+    """
+    if not CFG.app.publish_prefinal_grid:
+        return
+
+    sh = _open_sheet()
+    with SessionLocal() as db:
+        heat_ids = [
+            sid for (sid,) in db.query(RaceSession.id)
+                                 .filter(RaceSession.event_id == event_id,
+                                         RaceSession.class_id == class_id,
+                                         RaceSession.session_type == "Heat")
+                                 .all()
+        ]
+        if not heat_ids:
+            _publish_rows(sh, "Raw_PrefinalGrid",
+                          ["EventID","ClassID","Class","GridPos","DriverID","Number","Driver","TotalHeatPts","QualTiebreak","UpdatedUTC"],
+                          [["", "", "No Heat sessions found for this class/event.", "", "", "", "", "", "", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")]])
+            return
+
+        sub_latest = (
+            db.query(PointAward.session_id, func.max(PointAward.version).label("v"))
+              .filter(PointAward.session_id.in_(heat_ids), PointAward.basis == "official")
+              .group_by(PointAward.session_id)
+              .subquery()
+        )
+
+        qa = (
+            db.query(PointAward, Driver)
+              .join(Driver, Driver.id == PointAward.driver_id)
+              .join(sub_latest, (PointAward.session_id == sub_latest.c.session_id) &
+                               (PointAward.version == sub_latest.c.v))
+              .all()
+        )
+
+        agg: Dict[int, int] = {}
+        name_by_driver: Dict[int, str] = {}
+        num_by_driver: Dict[int, str] = {}
+        for e in db.query(Entry).filter(Entry.event_id == event_id,
+                                        Entry.class_id == class_id).all():
+            num_by_driver[e.driver_id] = e.number or ""
+
+        for pa, d in qa:
+            agg[d.id] = agg.get(d.id, 0) + (pa.total_points or 0)
+            name_by_driver[d.id] = f"{d.first_name} {d.last_name}".strip()
+
+        q_ids = [
+            sid for (sid,) in db.query(RaceSession.id)
+                                 .filter(RaceSession.event_id == event_id,
+                                         RaceSession.class_id == class_id,
+                                         RaceSession.session_type == "Qualifying")
+                                 .all()
+        ]
+        qual_best_pos: Dict[int, int] = {}
+        if q_ids:
+            sub_latest_q = (
+                db.query(Result.session_id, func.max(Result.version).label("v"))
+                  .filter(Result.session_id.in_(q_ids), Result.basis == "official")
+                  .group_by(Result.session_id)
+                  .subquery()
+            )
+            qres = (
+                db.query(Result)
+                  .join(sub_latest_q, (Result.session_id == sub_latest_q.c.session_id) &
+                                     (Result.version == sub_latest_q.c.v))
+                  .filter(Result.position.isnot(None))
+                  .all()
+            )
+            for r in qres:
+                cur = qual_best_pos.get(r.driver_id)
+                if cur is None or (r.position or 10**6) < cur:
+                    qual_best_pos[r.driver_id] = r.position or cur or 10**6
+
+        def key_fn(drv_id: int):
+            return (agg.get(drv_id, 10**6),
+                    qual_best_pos.get(drv_id, 10**6),
+                    name_by_driver.get(drv_id, ""))
+
+        ranked = sorted(agg.keys(), key=key_fn)
+
+        class_name = (db.query(RaceSession)
+                        .filter(RaceSession.class_id == class_id,
+                                RaceSession.event_id == event_id)
+                        .first())
+        class_name = class_name.race_class.name if class_name and class_name.race_class else ""
+
+        header = ["EventID","ClassID","Class","GridPos","DriverID","Number","Driver","TotalHeatPts","QualTiebreak","UpdatedUTC"]
+        now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        rows: List[List[Any]] = []
+        for i, drv_id in enumerate(ranked, start=1):
+            rows.append([
+                event_id, class_id, class_name, i, drv_id,
+                num_by_driver.get(drv_id, ""),
+                name_by_driver.get(drv_id, ""),
+                agg.get(drv_id, 0),
+                qual_best_pos.get(drv_id, ""),
+                now_utc
+            ])
+
+    _publish_rows(sh, "Raw_PrefinalGrid", header, rows)
