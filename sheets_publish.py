@@ -601,13 +601,16 @@ def ensure_simple_views(event_id: int) -> None:
 # =========================
 def publish_class_results_view(session_id: int) -> None:
     """
-    Publish latest OFFICIAL results for the session into a single tab 'Class_Results'.
+    Publish latest OFFICIAL results for the session into a tab '<ClassName> Results'.
     Intended for Heat/Qualifying sessions. Overwrites the tab each time.
     """
     sh = _open_sheet()
     with SessionLocal() as db:
         sess = _get_session(db, session_id)
         data = _fetch_official_results(db, session_id)
+        
+        class_name = getattr(sess.race_class, "name", "Unknown") if sess and sess.race_class else "Unknown"
+        tab_name = f"{class_name} Results"
 
         header = ["Class", "Session", "Pos", "#", "Driver", "Team", "Chassis", "Best Lap", "Last Lap", "Status", "Updated"]
         rows: List[List[Any]] = []
@@ -618,7 +621,7 @@ def publish_class_results_view(session_id: int) -> None:
         else:
             for row in data:
                 rows.append([
-                    getattr(sess.race_class, "name", "") if sess else "",
+                    class_name,
                     f"{sess.session_type} - {sess.session_name or ''}" if sess else "",
                     row.get("pos") or "",
                     row.get("number", ""),
@@ -631,7 +634,7 @@ def publish_class_results_view(session_id: int) -> None:
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ])
 
-    _publish_rows(sh, "Class_Results", header, rows)
+    _publish_rows(sh, tab_name, header, rows)
 
 def publish_class_heat_totals_view(class_id: int, event_id: int) -> None:
     """
@@ -732,7 +735,8 @@ def publish_class_heat_totals_view(class_id: int, event_id: int) -> None:
                 now,
             ])
 
-    _publish_rows(sh, "Class_HeatTotals", header, rows)
+    tab_name = f"{class_name} Heat Totals"
+    _publish_rows(sh, tab_name, header, rows)
 
 def publish_class_prefinal_view(class_id: int, event_id: int) -> None:
     """
@@ -802,7 +806,7 @@ def publish_class_prefinal_view(class_id: int, event_id: int) -> None:
         cls = (db.query(RaceSession)
                  .filter(RaceSession.class_id == class_id, RaceSession.event_id == event_id)
                  .first())
-        class_name = cls.race_class.name if cls and cls.race_class else ""
+        class_name = cls.race_class.name if cls and cls.race_class else "Unknown"
 
         header = ["Class","Grid Pos","#","Driver","Total Heat Pts","Qual Tiebreak","Updated"]
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -818,7 +822,8 @@ def publish_class_prefinal_view(class_id: int, event_id: int) -> None:
                 now,
             ])
 
-    _publish_rows(sh, "Class_Prefinal", header, rows)
+    tab_name = f"{class_name} Prefinal"
+    _publish_rows(sh, tab_name, header, rows)
 
 def publish_raw_prefinal_grid(class_id: int, event_id: int) -> None:
     """

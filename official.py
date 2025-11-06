@@ -128,17 +128,26 @@ def _apply_penalties_preview(db: Session, sess: RaceSession, views: Dict[int, Re
 
     # Apply position drops only for race-type sessions
     if sess.session_type in ("Heat", "Prefinal", "Final"):
-        # Build a list of race drivers w/ numeric positions
+        # Build a list of race drivers w/ numeric positions, sorted by original finishing order
         race_list = [rv for rv in views.values() if rv.position is not None]
-        # Apply drops
-        for rv in race_list:
-            if rv.driver_id in pos_drops and rv.position is not None:
-                rv.position = rv.position + pos_drops[rv.driver_id]
-
-        # Re-rank by (position, best_lap_ms as tie-breaker)
         race_list.sort(key=lambda r: (r.position if r.position is not None else 10**9,
                                       r.best_lap_ms if r.best_lap_ms is not None else 10**9))
-        # Reassign contiguous positions starting at 1
+        
+        # Apply position penalties by moving drivers down in the sorted list
+        # Process penalties in order of original position to avoid conflicts
+        for driver_id, drop_count in sorted(pos_drops.items(), key=lambda x: next((rv.position for rv in race_list if rv.driver_id == x[0]), 10**9) or 10**9):
+            if drop_count <= 0:
+                continue
+            # Find driver's current index in race_list
+            driver_idx = next((i for i, rv in enumerate(race_list) if rv.driver_id == driver_id), None)
+            if driver_idx is not None:
+                # Remove driver from current position
+                driver_rv = race_list.pop(driver_idx)
+                # Insert at new position (bounded by list length)
+                new_idx = min(driver_idx + drop_count, len(race_list))
+                race_list.insert(new_idx, driver_rv)
+        
+        # Reassign contiguous positions starting at 1 after all penalties applied
         for i, rv in enumerate(race_list, start=1):
             rv.position = i
 

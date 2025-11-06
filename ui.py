@@ -5,6 +5,7 @@ from pathlib import Path
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+from tkinter import font as tkfont
 from typing import List, Dict, Optional
 from datetime import datetime
 from sqlalchemy.orm import joinedload
@@ -13,7 +14,7 @@ from sqlalchemy.orm import joinedload
 # === Your project modules ===
 from db import SessionLocal, init_db
 from models import (
-    Session as RaceSession, Result, Driver, Entry, Penalty
+    Session as RaceSession, Result, Driver, Entry, Penalty, Lap
 )
 # official.py should expose:
 #   - compute_official_order(db, session_id) -> List[Result] (transient, not persisted)
@@ -117,6 +118,34 @@ def ms_fmt(ms: Optional[int]) -> str:
         return f"{m}:{(s - 60*m):06.3f}"
     return f"{s:.3f}"
 
+# --- UI helpers ---
+def autosize_treeview_columns(tv: ttk.Treeview, columns: List[str], padding: int = 12,
+                              min_widths: Optional[Dict[str, int]] = None,
+                              max_widths: Optional[Dict[str, int]] = None) -> None:
+    """Resize specified columns to fit the widest cell value or header.
+    - padding: extra pixels to add for readability
+    - min_widths/max_widths: optional per-column constraints
+    """
+    try:
+        fnt = tkfont.nametofont("TkDefaultFont")
+    except Exception:
+        fnt = None
+    for col in columns:
+        # Start with header text width
+        header_text = col.upper()
+        max_w = fnt.measure(header_text) if fnt else len(header_text) * 7
+        for iid in tv.get_children():
+            val = tv.set(iid, col)
+            txt = str(val)
+            w = fnt.measure(txt) if fnt else len(txt) * 7
+            if w > max_w:
+                max_w = w
+        if min_widths and col in min_widths:
+            max_w = max(max_w, int(min_widths[col]))
+        if max_widths and col in max_widths:
+            max_w = min(max_w, int(max_widths[col]))
+        tv.column(col, width=int(max_w + padding))
+
 # ---------- Tkinter App ----------
 class PenaltyApp(tk.Tk):
     def __init__(self):
@@ -161,12 +190,17 @@ class PenaltyApp(tk.Tk):
         # Left: provisional table
         self.prov_frame = ttk.Frame(mid)
         ttk.Label(self.prov_frame, text="Provisional (latest)").pack(anchor="w")
-        self.prov_tv = ttk.Treeview(self.prov_frame, columns=("pos","num","name","status","best","last"),
+        self.prov_tv = ttk.Treeview(self.prov_frame, columns=("pos","num","name","best","last"),
                                     show="headings", height=20)
-        for c, w in [("pos",50),("num",70),("name",220),("status",80),("best",90),("last",90)]:
+        for c, w in [("pos",50),("num",70),("name",260),("best",90),("last",90)]:
             self.prov_tv.heading(c, text=c.upper())
-            self.prov_tv.column(c, width=w, anchor="w")
+            # Default widths; we'll autosize after filling data
+            self.prov_tv.column(c, width=w, anchor="w", stretch=(c == "name"))
         self.prov_tv.pack(fill="both", expand=True)
+        # Horizontal scrollbar for provisional table
+        self.prov_xscroll = ttk.Scrollbar(self.prov_frame, orient="horizontal", command=self.prov_tv.xview)
+        self.prov_tv.configure(xscrollcommand=self.prov_xscroll.set)
+        self.prov_xscroll.pack(fill="x")
         mid.add(self.prov_frame, weight=3)
 
         # Center: penalties (form + table)
@@ -187,18 +221,30 @@ class PenaltyApp(tk.Tk):
         ttk.Label(form, text="Value").grid(row=0, column=4, sticky="w")
         self.value_entry = ttk.Entry(form, width=10)
         self.value_entry.grid(row=0, column=5, padx=4)
-        ttk.Label(form, text="(e.g. 3 / 5s / lap#)").grid(row=0, column=6, sticky="w")
+        ttk.Label(form, text="(e.g. 3 / 5s / lap# or 'best')").grid(row=0, column=6, sticky="w")
 
         ttk.Label(form, text="Note").grid(row=1, column=0, sticky="w", pady=(4,0))
         self.note_entry = ttk.Entry(form, width=40)
         self.note_entry.grid(row=1, column=1, columnspan=5, sticky="we", padx=4, pady=(4,0))
         ttk.Button(form, text="Add", command=self.add_penalty).grid(row=1, column=6, padx=4, pady=(4,0))
 
-        # quick preset buttons
+        # quick preset buttons (common SKUSA penalties)
         presets = ttk.Frame(self.pen_frame); presets.pack(fill="x", pady=(0,4))
-        ttk.Label(presets, text="Quick:").pack(side="left")
-        for label, payload in [("-1 pos","pos:1"),("-3 pos","pos:3"),("+5s","time:5"),("DQ","dq"),("LapInv","lap:1")]:
-            ttk.Button(presets, text=label, command=lambda p=payload: self.apply_preset(p)).pack(side="left", padx=3)
+        quick_items = [
+            ("+3s", "time:3"),      # PBB one side, jump start, pushing, scrubbing, 2 wheels out, blocking, track limits
+            ("+5s", "time:5"),      # 4 wheels out, cut track advantage, careless IR
+            ("+6s", "time:6"),      # PBB both sides
+            ("+10s", "time:10"),    # advancing after cone, manipulating start, passing under yellow, unsafe re-entry, reckless IR
+            ("Loss Fast Lap", "lap:best"),  # Qualifying common
+            ("DQ", "dq"),
+            ("-1 pos", "pos:1"),    # keep position drops as needed by stewards
+            ("-3 pos", "pos:3"),
+        ]
+        # Place buttons in two rows using grid so they fit well without shifting side panes
+        ttk.Label(presets, text="Quick:").grid(row=0, column=0, padx=(0,6), pady=(0,2), sticky="w")
+        for idx, (label, payload) in enumerate(quick_items):
+            r, c = divmod(idx, 4)  # 4 buttons per row
+            ttk.Button(presets, text=label, command=lambda p=payload: self.apply_preset(p)).grid(row=r, column=c+1, padx=3, pady=2, sticky="w")
 
         self.pen_tv = ttk.Treeview(self.pen_frame, columns=("driver_id","type","value","note","created"),
                                    show="headings", height=12)
@@ -217,12 +263,16 @@ class PenaltyApp(tk.Tk):
         # Right: preview official
         self.prev_frame = ttk.Frame(mid)
         ttk.Label(self.prev_frame, text="Preview: Official (after penalties)").pack(anchor="w")
-        self.prev_tv = ttk.Treeview(self.prev_frame, columns=("pos","num","name","status","best","last"),
+        self.prev_tv = ttk.Treeview(self.prev_frame, columns=("pos","num","name","best","last"),
                                     show="headings", height=20)
-        for c, w in [("pos",50),("num",70),("name",220),("status",80),("best",90),("last",90)]:
+        for c, w in [("pos",50),("num",70),("name",260),("best",90),("last",90)]:
             self.prev_tv.heading(c, text=c.upper())
-            self.prev_tv.column(c, width=w, anchor="w")
+            self.prev_tv.column(c, width=w, anchor="w", stretch=(c == "name"))
         self.prev_tv.pack(fill="both", expand=True)
+        # Horizontal scrollbar for official preview table
+        self.prev_xscroll = ttk.Scrollbar(self.prev_frame, orient="horizontal", command=self.prev_tv.xview)
+        self.prev_tv.configure(xscrollcommand=self.prev_xscroll.set)
+        self.prev_xscroll.pack(fill="x")
         mid.add(self.prev_frame, weight=3)
 
         # Listener tab content
@@ -438,11 +488,12 @@ class PenaltyApp(tk.Tk):
                     r["pos"] or "",
                     r["num"] or "",
                     r["name"] or "",
-                    r["status"] or "",
                     ms_fmt(r["best_ms"]),
                     ms_fmt(r["last_ms"]),
                 )
             )
+
+        # (auto-size disabled per request)
 
     def refresh_penalties(self):
         for i in self.pen_tv.get_children():
@@ -514,11 +565,12 @@ class PenaltyApp(tk.Tk):
                         r.position or "",
                         num_cache.get(r.driver_id, ""),
                         name_cache.get(r.driver_id, ""),
-                        r.status_code or "",
                         ms_fmt(r.best_lap_ms),
                         ms_fmt(r.last_lap_ms),
                     )
                 )
+
+        # (auto-size disabled per request)
 
     def apply_preset(self, payload: str):
         # payload shapes: "pos:3" | "time:5" | "dq" | "lap:1"
@@ -571,11 +623,27 @@ class PenaltyApp(tk.Tk):
                     messagebox.showerror("Value", "Time must be a number (seconds).")
                     return
             elif ptype == "LAP_INVALID":
-                try:
-                    pen.lap_no = int(val or "0")
-                except Exception:
-                    messagebox.showerror("Value", "Lap # must be an integer.")
-                    return
+                # Support special keyword 'best' to invalidate driver's best lap
+                if val in ("best", "fast", "bestlap", "fastlap"):
+                    best_lap = (
+                        db.query(Lap)
+                          .filter(Lap.session_id == sid,
+                                  Lap.driver_id == drv_id,
+                                  Lap.is_valid == True,
+                                  Lap.lap_time_ms.isnot(None))
+                          .order_by(Lap.lap_time_ms.asc(), Lap.lap_number.asc())
+                          .first()
+                    )
+                    if not best_lap:
+                        messagebox.showerror("Value", "No valid laps found for this driver to invalidate.")
+                        return
+                    pen.lap_no = int(best_lap.lap_number)
+                else:
+                    try:
+                        pen.lap_no = int(val or "0")
+                    except Exception:
+                        messagebox.showerror("Value", "Lap # must be an integer.")
+                        return
 
             db.add(pen)
             db.commit()
