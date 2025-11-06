@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supernats28-points"
-version = "0.1.8"
+version = "0.2.0"
 description = "SuperNats 28 Points Toolkit: ingest Orbits, apply penalties, publish to Sheets"
 authors = [{ name = "Luis" }]
 readme = "README.md"
