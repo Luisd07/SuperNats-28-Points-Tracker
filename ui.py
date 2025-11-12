@@ -311,11 +311,30 @@ class PenaltyApp(tk.Tk):
         ttk.Label(parent, textvariable=self.listener_status).pack(anchor="w", padx=8)
 
         # If the listener was started by the CLI launcher in this same process,
-        # reflect that in the status so users don't double-start from the UI.
-        if os.getenv("SN28_LISTENER_RUNNING") == "1":
-            lh = os.getenv("SN28_LISTENER_HOST", self.listen_host_var.get())
-            lp = os.getenv("SN28_LISTENER_PORT", self.listen_port_var.get())
-            self.listener_status.set(f"Listener: running (launcher) on {lh}:{lp}")
+        # attach to the running reader so the UI can control it (and edit host/port).
+        try:
+            import socket_listener as _sl
+            launched_reader = getattr(_sl, "_launched_reader", None)
+            launched_thread = getattr(_sl, "_launched_thread", None)
+            if launched_reader is not None:
+                # reflect current host/port in UI fields
+                try:
+                    self.listen_host_var.set(getattr(launched_reader, "host", self.listen_host_var.get()))
+                    self.listen_port_var.set(str(getattr(launched_reader, "port", self.listen_port_var.get())))
+                except Exception:
+                    pass
+                self._listener_reader = launched_reader
+                # attach thread if available (may be None)
+                self._listener_thread = launched_thread
+                lh = getattr(launched_reader, "host", os.getenv("SN28_LISTENER_HOST", self.listen_host_var.get()))
+                lp = getattr(launched_reader, "port", os.getenv("SN28_LISTENER_PORT", self.listen_port_var.get()))
+                self.listener_status.set(f"Listener: running (launcher) on {lh}:{lp}")
+        except Exception:
+            # fall back to env var only when module not accessible
+            if os.getenv("SN28_LISTENER_RUNNING") == "1":
+                lh = os.getenv("SN28_LISTENER_HOST", self.listen_host_var.get())
+                lp = os.getenv("SN28_LISTENER_PORT", self.listen_port_var.get())
+                self.listener_status.set(f"Listener: running (launcher) on {lh}:{lp}")
 
     # ----- small helper -----
     def _require_session(self) -> Optional[RaceSession]:
@@ -326,14 +345,25 @@ class PenaltyApp(tk.Tk):
 
     # ----- Listener control -----
     def start_listener(self):
-        # If the launcher already started a listener thread in this process, avoid double-starts.
+        # If the launcher already started a listener in another process, avoid double-starts.
         if os.getenv("SN28_LISTENER_RUNNING") == "1":
-            messagebox.showinfo(
-                "Listener",
-                "A listener is already running (started by the launcher).\n\n"
-                "If you want to control it from here, start the UI via 'sn28 ui' or stop the external listener first."
-            )
-            return
+            # If the listener was launched in this same process and exposed, allow control.
+            try:
+                import socket_listener as _sl
+                if not getattr(_sl, "_launched_reader", None):
+                    messagebox.showinfo(
+                        "Listener",
+                        "A listener is already running (started by the launcher).\n\n"
+                        "If you want to control it from here, start the UI via 'sn28 ui' or stop the external listener first."
+                    )
+                    return
+            except Exception:
+                messagebox.showinfo(
+                    "Listener",
+                    "A listener is already running (started by the launcher).\n\n"
+                    "If you want to control it from here, start the UI via 'sn28 ui' or stop the external listener first."
+                )
+                return
         if self._listener_thread and self._listener_thread.is_alive():
             messagebox.showinfo("Listener", "Listener already running.")
             return

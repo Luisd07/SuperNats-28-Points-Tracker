@@ -16,6 +16,12 @@ from models import (
     BasisEnum, SessionTypeEnum, Penalty
 )
 
+# Exposed runtime handles so external launcher/UI can attach to a running reader
+# These will be set by the launcher (`cli.py`) when it starts a listener thread,
+# and by `run_socket_listener` when the OrbitsTCPReader is created.
+_launched_reader: Optional[object] = None
+_launched_thread: Optional[object] = None
+
 # ---------------------- Helpers ----------------------
 
 def parseTimeSTR(s: str) -> Optional[float]:

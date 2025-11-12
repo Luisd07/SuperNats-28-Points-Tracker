@@ -20,6 +20,12 @@ def run_socket_listener(host: str, port: int):
         read_timeout=5.0,
         max_backoff=10.0,
     )
+    # If the UI is running in the same process, expose the reader so the UI can control it
+    try:
+        import socket_listener as _sl
+        _sl._launched_reader = reader
+    except Exception:
+        pass
     reader.run()
 
 
@@ -110,6 +116,12 @@ def main():
             os.environ["SN28_LISTENER_PORT"] = str(args.listen_port)
             t = threading.Thread(target=run_socket_listener, args=(args.listen_host, args.listen_port), daemon=True)
             t.start(); threads.append(t)
+            # Expose the launcher thread to the socket_listener module so UI can attach
+            try:
+                import socket_listener as _sl
+                _sl._launched_thread = t
+            except Exception:
+                pass
             logging.info("Listener thread started on %s:%s", args.listen_host, args.listen_port)
 
         if args.api:
