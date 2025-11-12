@@ -78,7 +78,8 @@ def main():
     if not getattr(args, "cmd", None):
         args.cmd = "run"
         # synthesize attributes used by 'run'
-        args.listen = True
+        
+        args.listen = False
         args.ui = True
         args.api = False
         args.listen_host = os.getenv("ORBITS_HOST", "127.0.0.1")
