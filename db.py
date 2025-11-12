@@ -44,8 +44,57 @@ def init_db():
     from models import Base
     # Ensure parent exists
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # Create tables if missing
+
+    # Track whether the DB file existed before we called create_all. If it did
+    # not, this is a fresh DB and seeding is appropriate. If it did exist, we
+    # will still check whether the points scheme is present and only seed when
+    # missing — we must not overwrite an existing DB.
+    db_file_existed = _DB_PATH.exists()
+
+    # Create tables if missing (this will not overwrite an existing DB file)
     Base.metadata.create_all(bind=engine)
+
+    # Auto-seed default points scheme if not present. Only insert rows when
+    # the Point scheme is absent to avoid duplicates. This covers the case
+    # where a DB file exists but the points were not yet seeded.
+    try:
+        from models import Point, PointScale
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        with SessionLocal() as db:
+            existing = db.query(Point).filter(Point.name == "SKUSA_SN28").first()
+            if existing:
+                logger.debug("Points scheme SKUSA_SN28 already present; skipping auto-seed")
+                return
+
+            logger.info("Auto-seeding default points scheme (SKUSA_SN28) into DB: %s", _DB_PATH)
+
+            # create default scheme (defaults: no bonus lap/pole)
+            pt = Point(name="SKUSA_SN28", bonus_lap=False, bonus_pole=False)
+            db.add(pt)
+            db.flush()
+
+            # Heat scale: position 1 -> 0 points, others map to their position
+            for position in range(1, 121):
+                heat_points = 0 if position == 1 else position
+                db.add(PointScale(point_id=pt.id, session_type="Heat", position=position, points=heat_points))
+
+            # Qualifying scale: store 1..N (rendered elsewhere as fractional hundredths)
+            for position in range(1, 121):
+                db.add(PointScale(point_id=pt.id, session_type="Qualifying", position=position, points=position))
+
+            db.commit()
+            logger.info("Seeding complete: SKUSA_SN28 inserted with %d heat entries", 120)
+    except Exception:
+        # Non-fatal: if models/DB unavailable or commit fails, ignore and continue.
+        # The app can still function; user can run the explicit seeder later.
+        try:
+            import logging
+            logging.getLogger(__name__).exception("Auto-seed failed")
+        except Exception:
+            pass
 
 
 def get_db_path() -> Path:
