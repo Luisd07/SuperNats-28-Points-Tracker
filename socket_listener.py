@@ -607,7 +607,13 @@ class OrbitsTCPReader:
                                         sess.ended_at = datetime.now(timezone.utc)
                                     db.commit()
 
-            except (socket.timeout, ConnectionError, OSError):
+            except (socket.timeout, ConnectionError, OSError) as e:
+                logging.getLogger(__name__).debug("Socket/connect/read error: %s", e)
+                time.sleep(backoff)
+                backoff = min(self.max_backoff, backoff * 2)
+            except Exception:
+                # Catch-all to prevent silent crashes — log and retry with backoff
+                logging.getLogger(__name__).exception("Uncaught exception in OrbitsTCPReader; will retry")
                 time.sleep(backoff)
                 backoff = min(self.max_backoff, backoff * 2)
             finally:
