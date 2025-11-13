@@ -216,10 +216,38 @@ def publish_official_results(session_id: int) -> None:
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         ])
 
-    ws.clear()
-    if rows:
-        # Use keyword args; ignore type checker complaint about literal string type
-        ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+    # Merge: preserve other sessions/classes in this tab. Replace rows that match
+    # this class+session, append otherwise.
+    try:
+        existing = ws.get_all_values()
+    except Exception:
+        existing = []
+
+    session_label = f"{sess.session_type} - {sess.session_name or ''}" if sess else ""
+    class_name = getattr(sess.race_class, "name", "") if sess else ""
+
+    new_body: List[List[Any]] = []
+    if existing:
+        # Preserve header row if present; otherwise use our header
+        existing_header = existing[0]
+        new_body.append(existing_header if existing_header else header)
+        # Keep any rows that are not for this class+session
+        for row in existing[1:]:
+            # defensive: check at least two columns
+            r_class = row[0] if len(row) > 0 else ""
+            r_session = row[1] if len(row) > 1 else ""
+            if not (r_class == class_name and r_session == session_label):
+                new_body.append(row)
+    else:
+        new_body.append(header)
+
+    # Append our freshly composed rows for this session
+    for r in rows[1:]:
+        new_body.append(r)
+
+    if new_body:
+        ws.clear()
+        ws.update(range_name="A1", values=new_body, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
 
 def publish_heat_points(session_id: int) -> None:
     if not CFG.app.publish_points:
@@ -634,7 +662,33 @@ def publish_class_results_view(session_id: int) -> None:
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ])
 
-    _publish_rows(sh, tab_name, header, rows)
+    # Merge/update behavior: read existing tab, remove rows for this session (if any), then rewrite
+    ws = _safe_ws(sh, tab_name, rows=1000, cols=16)
+    try:
+        existing = ws.get_all_values()
+    except Exception:
+        existing = []
+
+    session_label = f"{sess.session_type} - {sess.session_name or ''}" if sess else ""
+    new_body: List[List[Any]] = []
+    if existing:
+        existing_header = existing[0]
+        new_body.append(existing_header if existing_header else header)
+        for row in existing[1:]:
+            # keep rows that are not for this session
+            r_session = row[1] if len(row) > 1 else ""
+            if r_session != session_label:
+                new_body.append(row)
+    else:
+        new_body.append(header)
+
+    # Append this session's rows
+    for rr in rows:
+        new_body.append(rr)
+
+    if new_body:
+        ws.clear()
+        ws.update(range_name="A1", values=new_body, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
 
 def publish_class_heat_totals_view(class_id: int, event_id: int) -> None:
     """

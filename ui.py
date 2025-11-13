@@ -6,7 +6,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter import font as tkfont
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, cast
 from datetime import datetime
 from sqlalchemy.orm import joinedload
 
@@ -159,6 +159,10 @@ class PenaltyApp(tk.Tk):
         self._listener_reader: Optional[OrbitsTCPReader] = None
         self.listener_status = tk.StringVar(value="Listener: stopped")
         self._settings: Dict[str, str] = self._load_settings()
+        # Top: session picker + info + publish
+        # Auto-refresh state (UI polling for latest results)
+        self.auto_refresh_var = tk.BooleanVar(value=False)
+        self._auto_refresh_job: Optional[object] = None
 
         # Top: session picker + info + publish
         top = ttk.Frame(self)
@@ -168,8 +172,10 @@ class PenaltyApp(tk.Tk):
         self.session_cb = ttk.Combobox(top, state="readonly", width=60)
         self.session_cb.pack(side="left", padx=6)
         self.session_cb.bind("<<ComboboxSelected>>", self.on_session_change)
-
         ttk.Button(top, text="Refresh", command=self.refresh_sessions).pack(side="left", padx=4)
+        # Auto-refresh toggle: when enabled, poll refresh_all() every 500ms
+        ttk.Checkbutton(top, text="Auto Refresh (0.5s)", variable=self.auto_refresh_var,
+                        command=lambda: self._on_auto_refresh_toggle()).pack(side="left", padx=6)
         ttk.Button(top, text="Publish Official → Sheets", command=self.publish_official).pack(side="right")
         ttk.Button(top, text="Publish Heat Totals (Class)", command=self.publish_heat_totals_for_class).pack(side="right", padx=(0,6))
         ttk.Button(top, text="Publish Prefinal Grid (Class)", command=self.publish_prefinal_for_class).pack(side="right", padx=(0,6))
@@ -423,6 +429,51 @@ class PenaltyApp(tk.Tk):
         self._listener_thread = None
         self._listener_reader = None
         self.listener_status.set("Listener: stopped")
+
+    # ----- Auto-refresh (UI polling) -----
+    def _on_auto_refresh_toggle(self) -> None:
+        """Called when the Auto Refresh checkbutton is toggled."""
+        if self.auto_refresh_var.get():
+            self._start_auto_refresh()
+            try:
+                self.status.set("Auto-refresh: ON")
+            except Exception:
+                pass
+        else:
+            self._stop_auto_refresh()
+            try:
+                self.status.set("Auto-refresh: OFF")
+            except Exception:
+                pass
+
+    def _start_auto_refresh(self) -> None:
+        """Begin scheduling periodic refreshes every 500 ms."""
+        if getattr(self, "_auto_refresh_job", None) is not None:
+            return
+        # schedule immediately
+        self._schedule_auto_refresh()
+
+    def _schedule_auto_refresh(self) -> None:
+        """Invoke refresh_all and schedule next invocation in 500ms."""
+        try:
+            # Keep this resilient to exceptions in refresh
+            self.refresh_all()
+        except Exception:
+            pass
+        try:
+            self._auto_refresh_job = self.after(500, self._schedule_auto_refresh)
+        except Exception:
+            self._auto_refresh_job = None
+
+    def _stop_auto_refresh(self) -> None:
+        """Cancel the scheduled auto-refresh if present."""
+        if getattr(self, "_auto_refresh_job", None) is not None:
+            try:
+                # after_cancel expects the id returned by `after`; cast to satisfy static checkers
+                self.after_cancel(cast(str, self._auto_refresh_job))
+            except Exception:
+                pass
+            self._auto_refresh_job = None
 
     def on_close(self):
         try:

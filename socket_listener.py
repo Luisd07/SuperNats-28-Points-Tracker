@@ -577,35 +577,41 @@ class DBIngestor:
 
     def get_or_create_class(self, db: Session, event_id: int, class_name: str) -> RaceClass:
         name = strip_group_token(class_name) or "Unknown Class"
-
+        # If we have a cached current_class_id, ensure it actually represents the
+        # same normalized class name for this event. If it doesn't, prefer to
+        # locate (or create) the proper class row rather than rename the cached
+        # class in-place (which caused previous sessions' class names to be
+        # overwritten).
         if self.current_class_id:
             rc = db.get(RaceClass, self.current_class_id)
-            if rc:
-                if name and rc.name != name:
-                    other = (db.query(RaceClass)
-                               .filter(RaceClass.event_id == event_id, RaceClass.name == name)
-                               .one_or_none())
-                    if other and other.id != rc.id:
-                        _merge_class_into(db, src=other, dst=rc)
-                    rc.name = name
-                    db.flush()
+            if rc and rc.event_id == event_id and rc.name == name:
                 return rc
 
+        # Try to find an exact normalized match first
         rc = (db.query(RaceClass)
                 .filter(RaceClass.event_id == event_id, RaceClass.name == name)
                 .one_or_none())
-        if not rc and class_name.strip() and class_name.strip() != name:
-            # try raw legacy row and rename it to normalized to prevent future dups
-            rc = (db.query(RaceClass)
-                    .filter(RaceClass.event_id == event_id, RaceClass.name == class_name.strip())
-                    .one_or_none())
-            if rc:
-                rc.name = name
+
+        # If not found, try legacy/raw row with the original incoming class_name
+        if not rc and class_name and class_name.strip() and class_name.strip() != name:
+            legacy = (db.query(RaceClass)
+                        .filter(RaceClass.event_id == event_id, RaceClass.name == class_name.strip())
+                        .one_or_none())
+            if legacy:
+                # Prefer creating/renaming a new normalized row instead of mutating
+                # other unrelated rows: rename the legacy row into the normalized name
+                legacy.name = name
                 db.flush()
+                rc = legacy
+
+        # If still not found, create a new class row for this event
         if not rc:
             rc = RaceClass(event_id=event_id, name=name)
             db.add(rc); db.flush()
 
+        # Cache the class id for faster subsequent lookups within the same
+        # live session, but do NOT mutate other class rows when a different
+        # class name arrives in a later session.
         self.current_class_id = rc.id
         return rc
 
@@ -634,7 +640,15 @@ class DBIngestor:
             if session_type and sess.session_type != session_type:
                 sess.session_type = session_type
                 db.flush()
-        self._last_session_id = sess.id
+        # If we've switched to a new session, clear the saved lap cache so
+        # previously persisted lap numbers from a prior session do not prevent
+        # new laps from being recorded for karts that reuse numbers.
+        if self._last_session_id != sess.id:
+            self.saved_lap_no.clear()
+            self._last_session_id = sess.id
+        else:
+            # ensure it's set at least once
+            self._last_session_id = sess.id
         return sess
 
     # ---- Entities ----
