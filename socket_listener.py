@@ -524,43 +524,28 @@ class DBIngestor:
                     result.gap_to_p1_ms = None
 
             if sess.session_type in ("Practice", "Qualifying"):
-                # rank by best lap ascending; if none, push to bottom; tie-break by current order index
-                # build candidates
+                # Rank by best lap (ascending). If best lap missing, push to bottom but
+                # keep a stable tie-break using the running order from the feed.
+                # This mirrors the behavior in logOrbits.py: b = best_ms or sentinel,
+                # tie-break by position from the feed.
                 candidates = list(num_to_driver_id.keys())
-                # stable index from current order for tie-break
                 idx_in_order = {n: (ordered_nums.index(n) if n in ordered_nums else 10**6) for n in candidates}
-                # Build a last-lap map (ms) to use as fallback when best lap is not present.
-                last_map_ms: Dict[str, Optional[int]] = {}
-                for n in candidates:
-                    sec = s.last_lap.get(n)
-                    last_map_ms[n] = to_ms(sec) if sec is not None else None
+                SENTINEL = 10**12
+
+                # Debug inputs
+                logging.getLogger(__name__).debug(
+                    "Practice/Qual ranking inputs (pre): candidates=%s best_map_ms=%s ordered_nums=%s idx_in_order=%s",
+                    candidates, best_map_ms, ordered_nums, idx_in_order,
+                )
 
                 def key_fn(n: str):
-                    bm = best_map_ms.get(n)
-                    if bm is not None:
-                        # primary: best lap ascending
-                        return (0, bm, idx_in_order[n], n)
-                    lm = last_map_ms.get(n)
-                    if lm is not None:
-                        # secondary: last lap ascending (recent lap time) to approximate running pace
-                        return (1, lm, idx_in_order[n], n)
-                    # tertiary: no times -> push to bottom, tie-break by running order then number
-                    return (2, 10**12, idx_in_order[n], n)
+                    return (best_map_ms.get(n, SENTINEL), idx_in_order.get(n, 10**6), n)
 
-                # Debug: log inputs used for ranking to help diagnose ordering issues
-                logging.getLogger(__name__).debug(
-                    "Practice/Qual ranking inputs: candidates=%s best_map_ms=%s last_map_ms=%s ordered_nums=%s idx_in_order=%s",
-                    candidates, best_map_ms, last_map_ms, ordered_nums, idx_in_order,
-                )
                 ranked = sorted(candidates, key=key_fn)
                 logging.getLogger(__name__).debug("Practice/Qual ranked order: %s", ranked)
-                pos = 1
-                for n in ranked:
-                    # assign a position only if the driver has a best lap or a last lap
-                    assign_pos = pos if (best_map_ms.get(n) is not None or last_map_ms.get(n) is not None) else None
-                    upsert(n, assign_pos)
-                    if assign_pos is not None:
-                        pos += 1
+                # Assign contiguous positions to all candidates (matching logOrbits behavior)
+                for pos, n in enumerate(ranked, start=1):
+                    upsert(n, pos)
             else:
                 # Heat / Prefinal / Final => position by leader on track
                 # Determine candidates (all known numbers) and stable index from current order
