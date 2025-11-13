@@ -1,9 +1,12 @@
-# socket_listener.py
+# socket_listener.py (fixed)
+from __future__ import annotations
+
 import argparse
 import logging
 import csv
-from datetime import datetime, timezone, date
+import time
 import socket
+from datetime import datetime, timezone, date
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -16,34 +19,54 @@ from models import (
     BasisEnum, SessionTypeEnum, Penalty
 )
 
-# Exposed runtime handles so external launcher/UI can attach to a running reader
-# These will be set by the launcher (`cli.py`) when it starts a listener thread,
-# and by `run_socket_listener` when the OrbitsTCPReader is created.
+# ==========================
+# Tunables (match logOrbits)
+# ==========================
+MIN_VALID_LAP_MS = 30_000       # ignore < 30.000s (spikes / pits / noise)
+CROSS_WINDOW_MS = 1100          # window to collect same-lap $G lines after leader
+SAME_LAP_GRACE_WINDOWS = 1      # grace windows for unseen-but-same-lap drivers
+
+CHECKERED_STRINGS = {"checkered", "chequered", "finish", "finished", "chequer", "check"}
+
+# Exposed handles if you embed in threads
 _launched_reader: Optional[object] = None
 _launched_thread: Optional[object] = None
 
 # ---------------------- Helpers ----------------------
 
-def parseTimeSTR(s: str) -> Optional[float]:
-    s = (s or "").strip().strip('"')
-    if not s or s in {"0", "00:00.000", "00:00:00", "00:00:00.000"}:
-        return None
-    try:
-        parts = s.split(":")
-        if len(parts) == 3:
-            h = int(parts[0]); m = int(parts[1]); sec = float(parts[2])
-            return h * 3600 + m * 60 + sec
-        elif len(parts) == 2:
-            m = int(parts[0]); sec = float(parts[1])
-            return m * 60 + sec
-        else:
-            return float(parts[0])
-    except:
-        return None
+def parse_csv_row(line: str) -> Tuple[Optional[str], List[str]]:
+    line = (line or "").strip()
+    if not line or not line.startswith("$"):
+        return None, []
+    reader = csv.reader([line], delimiter=",", quotechar='"', skipinitialspace=False)
+    row = next(reader)
+    return (row[0], row[1:]) if row else (None, [])
 
-def csvFields(line: str) -> List[str]:
-    reader = csv.reader([line.rstrip("\r\n")], delimiter=',', quotechar='"', skipinitialspace=False)
-    return next(reader)
+def time_to_ms(s: str) -> int:
+    """00:mm:ss.mmm or hh:mm:ss.mmm → ms. Returns a HUGE sentinel for empties."""
+    s = (s or "").strip()
+    if not s or s in ("00:00:00", "00:00:00.000"):
+        return 10**12
+    parts = s.split(":")
+    if len(parts) == 3:
+        h, m, sec = parts
+    else:
+        h, m, sec = "0", parts[0], parts[1]
+    if "." in sec:
+        sec_i, ms = sec.split(".", 1)
+    else:
+        sec_i, ms = sec, "0"
+    try:
+        return int(h) * 3_600_000 + int(m) * 60_000 + int(sec_i) * 1000 + int(ms.ljust(3, "0")[:3])
+    except ValueError:
+        return 10**12
+
+def parseTimeSTR(s: str) -> Optional[float]:
+    """Legacy helper kept for compatibility with existing code that uses seconds."""
+    ms = time_to_ms((s or "").strip().strip('"'))
+    if ms >= 10**12:
+        return None
+    return ms / 1000.0
 
 def to_ms(seconds: Optional[float]) -> Optional[int]:
     return int(round(seconds * 1000)) if seconds is not None else None
@@ -54,15 +77,13 @@ def lock_session_type(name: str) -> str:
         return "Qualifying"
     if "heat" in n:
         return "Heat"
-    elif "prefinal" in n or "pre-final" in n or "pre final" in n:
+    if "prefinal" in n or "pre-final" in n or "pre final" in n:
         return "Prefinal"
-    elif "final" in n or "main" in n or "main event" in n:
+    if "final" in n or "main" in n or "main event" in n:
         return "Final"
-    elif "practice" in n or "happy hour" in n:
+    if "practice" in n or "happy hour" in n or "warm" in n:
         return "Practice"
     return ""
-
-CHECKERED_STRINGS = {"checkered", "chequered", "finish", "finished", "chequer", "check"}
 
 # ---------------------- State ----------------------
 
@@ -81,18 +102,52 @@ class TimingState:
     session_name: str = ""
     session_type: str = ""
     class_name: str = ""
-    event_name: str = ""            # from $E if present
+    event_name: str = ""
     track_name: str = ""
     track_length: Optional[float] = None
     flag: str = ""
 
     # live timing
-    last_lap: Dict[str, Optional[float]] = field(default_factory=dict)  # seconds
-    best_lap: Dict[str, Optional[float]] = field(default_factory=dict)  # seconds
-    lap_no: Dict[str, int] = field(default_factory=dict)                # feed lap number per kart
-    order: List[str] = field(default_factory=list)                      # running order by number
+    best_lap_str: Dict[str, str] = field(default_factory=dict)    # "mm:ss.mmm"
+    last_lap_str: Dict[str, str] = field(default_factory=dict)    # "mm:ss.mmm"
+    lap_no: Dict[str, int] = field(default_factory=dict)          # per kart
+    order_pos: Dict[str, int] = field(default_factory=dict)       # last seen $G pos
+    status_by_num: Dict[str, str] = field(default_factory=dict)   # from $H/$SR/$SP status
+
+    # crossing bookkeeping (from $G session elapsed)
+    g_last_cross_ms: Dict[str, int] = field(default_factory=dict)
+    g_last_cross_lap: Dict[str, int] = field(default_factory=dict)
+
+    # race commit model
+    display_order: List[str] = field(default_factory=list)
+    leader_lap: int = 0
+    window_active: bool = False
+    window_lap: int = 0
+    window_deadline_monotonic: float = 0.0
+    win_pos: Dict[str, int] = field(default_factory=dict)
+    win_cross_ms: Dict[str, int] = field(default_factory=dict)
+    win_seen: Dict[str, bool] = field(default_factory=dict)
+    missed_windows_same_lap: Dict[str, int] = field(default_factory=dict)
 
     drivers: Dict[str, DriverState] = field(default_factory=dict)
+
+    def reset_for_new_session(self):
+        self.best_lap_str.clear()
+        self.last_lap_str.clear()
+        self.lap_no.clear()
+        self.order_pos.clear()
+        self.status_by_num.clear()
+        self.g_last_cross_ms.clear()
+        self.g_last_cross_lap.clear()
+        self.display_order.clear()
+        self.leader_lap = 0
+        self.window_active = False
+        self.window_lap = 0
+        self.window_deadline_monotonic = 0.0
+        self.win_pos.clear()
+        self.win_cross_ms.clear()
+        self.win_seen.clear()
+        self.missed_windows_same_lap.clear()
 
 # ---------------------- Parser ----------------------
 
@@ -100,129 +155,239 @@ class OrbitsParser:
     def __init__(self):
         self.s = TimingState()
 
+    def _open_window(self, lap: int):
+        self.s.window_active = True
+        self.s.window_lap = lap
+        self.s.window_deadline_monotonic = time.monotonic() + (CROSS_WINDOW_MS / 1000.0)
+        self.s.win_pos.clear()
+        self.s.win_cross_ms.clear()
+        self.s.win_seen.clear()
+
+    def _close_window(self):
+        self.s.window_active = False
+        self.s.window_lap = 0
+        self.s.window_deadline_monotonic = 0.0
+        self.s.win_pos.clear()
+        self.s.win_cross_ms.clear()
+        self.s.win_seen.clear()
+
+    def _window_collect(self, num: str, pos: Optional[int], cross_ms: Optional[int], lap: int):
+        if not self.s.window_active or lap != self.s.window_lap:
+            return
+        if pos is not None:
+            self.s.win_pos[num] = pos
+        if cross_ms is not None:
+            self.s.win_cross_ms[num] = cross_ms
+        self.s.win_seen[num] = True
+
+    def _maybe_commit_window(self):
+        if not self.s.window_active:
+            return
+        if time.monotonic() < self.s.window_deadline_monotonic:
+            return
+
+        target_lap = self.s.window_lap
+
+        # ensure everyone exists in display_order
+        for num in self.s.drivers.keys():
+            if num not in self.s.display_order:
+                self.s.display_order.append(num)
+
+        def key_for(num: str) -> Tuple[int, int, int, int, str]:
+            laps = self.s.lap_no.get(num, 0)
+            k1 = -laps  # more laps first
+
+            # rank same-lap by window pos, unseen get grace then sent behind seen
+            if laps >= target_lap:
+                if self.s.win_seen.get(num, False):
+                    posk = self.s.win_pos.get(num, 99999)
+                    grace_pen = 0
+                else:
+                    missed = self.s.missed_windows_same_lap.get(num, 0)
+                    grace_pen = 0 if missed < SAME_LAP_GRACE_WINDOWS else 1
+                    posk = 99998 + grace_pen
+            else:
+                posk = 99999
+                grace_pen = 0
+
+            cross = self.s.win_cross_ms.get(num, self.s.g_last_cross_ms.get(num, 10**12))
+            try:
+                idx = self.s.display_order.index(num)
+            except ValueError:
+                idx = 99999
+            return (k1, posk, cross, idx, num)
+
+        nums = list(self.s.display_order)
+        nums.sort(key=key_for)
+
+        # maintain missed-window counters for same-lap unseen
+        for num in nums:
+            laps = self.s.lap_no.get(num, 0)
+            if laps >= target_lap:
+                if not self.s.win_seen.get(num, False):
+                    self.s.missed_windows_same_lap[num] = self.s.missed_windows_same_lap.get(num, 0) + 1
+                else:
+                    self.s.missed_windows_same_lap[num] = 0
+
+        self.s.display_order = nums
+        self.s.leader_lap = max(self.s.leader_lap, target_lap)
+        self._close_window()
+
     def parseLine(self, line: str):
-        if not line.strip():
-            return
-        try:
-            f = csvFields(line)
-        except:
-            return
-        if not f or not f[0].startswith("$"):
+        tag, f = parse_csv_row(line)
+        if not tag:
             return
 
-        tag = f[0]
+        def get(i: int, default: str = "") -> str:
+            return f[i] if i < len(f) else default
 
-        if tag == "$B" and len(f) >= 3:
-            self.s.session_name = f[2].strip('"')
-            self.s.session_type = lock_session_type(self.s.session_name)
+        if tag == "$B":
+            # $B, <ignored>, "Session Name"
+            new_name = get(1, "").strip() or get(2, "").strip()
+            if new_name:
+                if new_name != self.s.session_name:
+                    # session changed → reset race state
+                    self.s.reset_for_new_session()
+                self.s.session_name = new_name.strip('"')
+                self.s.session_type = lock_session_type(self.s.session_name)
 
-        elif tag == "$C" and len(f) >= 3:
-            self.s.class_name = f[2].strip('"')
+        elif tag == "$C":
+            self.s.class_name = get(1, "").strip().strip('"')
 
-        elif tag == "$E" and len(f) >= 3:
-            key = f[1].strip('"').upper()
-            val = f[2].strip('"')
+        elif tag == "$E":
+            key = get(0, "").strip().strip('"').upper()
+            val = get(1, "").strip().strip('"')
             if key == "TRACKNAME":
                 self.s.track_name = val
             elif key == "TRACKLENGTH":
                 try:
                     self.s.track_length = float(val)
-                except:
+                except Exception:
                     pass
             elif key in {"MEETING", "EVENT", "EVENTNAME", "TITLE"}:
                 self.s.event_name = val
 
         elif tag == "$A":
-            # $A,"48","48",12807698,"James","Overbeck","Coyote",1
-            number = f[1].strip('"')
-            if not number:
+            # $A,"<num>","<num>",<transponder>,"First","Last","Chassis",1
+            num = get(0, "").strip().strip('"') or get(1, "").strip().strip('"')
+            if not num:
                 return
-            d = self.s.drivers.get(number, DriverState(number))
-            d.transponder = f[3].strip('"') if len(f) > 3 else d.transponder
-            d.first   = f[4].strip('"') if len(f) > 4 else d.first
-            d.last    = f[5].strip('"') if len(f) > 5 else d.last
-            d.chassis = f[6].strip('"') if len(f) > 6 else d.chassis
-            if len(f) > 7:
+            d = self.s.drivers.get(num, DriverState(num))
+            d.transponder = get(2, d.transponder).strip().strip('"')
+            d.first = get(3, d.first).strip().strip('"')
+            d.last = get(4, d.last).strip().strip('"')
+            d.chassis = get(5, d.chassis).strip().strip('"')
+            act = get(6, "")
+            if act:
                 try:
-                    d.active = int(f[7]) == 1
-                except:
+                    d.active = int(act) == 1
+                except Exception:
                     pass
-            self.s.drivers[number] = d
+            self.s.drivers[num] = d
+            if num not in self.s.display_order:
+                self.s.display_order.append(num)
 
         elif tag == "$COMP":
-            # $COMP,"48","48",12807698,"James","Overbeck","Coyote","TeamName"
-            number = f[1].strip('"')
-            if not number:
+            # $COMP,"<num>","<num>",<transponder>,"First","Last","Chassis","Team"
+            num = get(0, "").strip().strip('"') or get(1, "").strip().strip('"')
+            if not num:
                 return
-            d = self.s.drivers.get(number, DriverState(number))
-            d.first   = f[4].strip('"') if len(f) > 4 else d.first
-            d.last    = f[5].strip('"') if len(f) > 5 else d.last
-            d.chassis = f[6].strip('"') if len(f) > 6 else d.chassis
-            d.team    = f[7].strip('"') if len(f) > 7 else d.team
-            self.s.drivers[number] = d
+            d = self.s.drivers.get(num, DriverState(num))
+            d.first = get(3, d.first).strip().strip('"')
+            d.last = get(4, d.last).strip().strip('"')
+            d.chassis = get(5, d.chassis).strip().strip('"')
+            d.team = get(6, d.team).strip().strip('"')
+            self.s.drivers[num] = d
+            if num not in self.s.display_order:
+                self.s.display_order.append(num)
 
         elif tag == "$F":
             # $F,9999,"00:01:16","16:45:26","00:06:43","Green "
-            if len(f) > 5:
-                self.s.flag = (f[5] or "").strip().strip('"').strip()
+            self.s.flag = get(4, get(5, "")).strip().strip('"')
+            # We don’t flip status here; DB ingest will set provisional on checkered.
 
-        elif tag == "$G" and len(f) >= 5:
-            # $G,<position>,"<number>",<lap_no>,"<last_lap>"
-            number = f[2].strip('"')
-            try:
-                pos = int(f[1])
-            except:
-                return
-            try:
-                lap_no = int(f[3])
-                self.s.lap_no[number] = max(lap_no, self.s.lap_no.get(number, 0))
-            except:
-                pass
+        elif tag == "$G":
+            # $G, <pos>, "<num>", <lap_no>, "<session_elapsed>"
+            pos_str = get(0, "").strip()
+            raw_num = get(1, "").strip()
+            num = raw_num.strip('"') if raw_num else raw_num
+            laps_str = get(2, "").strip()
+            sess_elapsed = get(3, "").strip().strip('"')
 
-            lap = parseTimeSTR(f[4])
-            if lap is not None:
-                self.s.last_lap[number] = lap
+            if num:
+                if pos_str.isdigit():
+                    self.s.order_pos[num] = int(pos_str)
+                if laps_str.isdigit():
+                    cur_lap = int(laps_str)
+                    self.s.lap_no[num] = max(self.s.lap_no.get(num, 0), cur_lap)
+                else:
+                    cur_lap = None
 
-            # maintain order
-            self.s.order = [c for c in self.s.order if c != number]
-            while len(self.s.order) < pos - 1:
-                self.s.order.append("")
-            self.s.order.insert(pos - 1, number)
-            while self.s.order and self.s.order[-1] == "":
-                self.s.order.pop()
+                if sess_elapsed and cur_lap is not None:
+                    cur_ms = time_to_ms(sess_elapsed)
+                    prev_lap = self.s.g_last_cross_lap.get(num)
+                    prev_ms = self.s.g_last_cross_ms.get(num)
+                    if prev_lap is not None and prev_ms is not None and cur_lap > prev_lap:
+                        delta = cur_ms - prev_ms
+                        if MIN_VALID_LAP_MS <= delta < 15 * 60 * 1000:
+                            # derive LAST + update BEST if improved
+                            mm = delta // 60000
+                            ss = (delta // 1000) % 60
+                            ms = delta % 1000
+                            lap_str = f"{mm:02d}:{ss:02d}.{ms:03d}"
+                            self.s.last_lap_str[num] = lap_str
+                            prev_best = self.s.best_lap_str.get(num)
+                            if not prev_best or delta < time_to_ms(prev_best):
+                                self.s.best_lap_str[num] = lap_str
+                    # update crossing refs
+                    self.s.g_last_cross_lap[num] = cur_lap
+                    self.s.g_last_cross_ms[num] = cur_ms
 
-        elif tag == "$H" and len(f) >= 5:
-            number = f[2].strip('"')
-            lap = parseTimeSTR(f[4])
-            if lap is not None:
-                self.s.last_lap[number] = lap
+                # Open window when leader starts a new lap
+                if pos_str == "1" and cur_lap is not None:
+                    if (not self.s.window_active) and (cur_lap > self.s.leader_lap):
+                        self._open_window(cur_lap)
 
-        elif tag == "$SP" and len(f) >= 5:
-            number = f[2].strip('"')
-            lap = parseTimeSTR(f[4])
-            if lap is not None:
-                self.s.last_lap[number] = lap
+                # Collect to current window
+                if cur_lap is not None:
+                    cross_ms = self.s.g_last_cross_ms.get(num, None)
+                    pos_val = int(pos_str) if pos_str.isdigit() else None
+                    self._window_collect(num, pos_val, cross_ms, cur_lap)
 
-        elif tag == "$SR" and len(f) >= 5:
-            # $SR,<pos>,"<number>",<lap_no>,"<best>",0
-            number = f[2].strip('"')
-            try:
-                lap_no = int(f[3])
-                self.s.lap_no[number] = max(lap_no, self.s.lap_no.get(number, 0))
-            except:
-                pass
-            best = parseTimeSTR(f[4])
-            if best is not None:
-                cur = self.s.best_lap.get(number)
-                self.s.best_lap[number] = min(best, cur) if cur is not None else best
+        elif tag in ("$H", "$SR", "$SP"):
+            # Normalized: pos, num, laps, last_time, status
+            pos = get(0, "").strip()
+            num = get(1, "").strip().strip('"')
+            laps_str = get(2, "").strip()
+            last_time = get(3, "").strip().strip('"')
+            status = get(4, "0").strip().strip('"')
+            if laps_str.isdigit():
+                self.s.lap_no[num] = max(self.s.lap_no.get(num, 0), int(laps_str))
+            if num and last_time:
+                ms = time_to_ms(last_time)
+                if ms >= MIN_VALID_LAP_MS:
+                    self.s.last_lap_str[num] = last_time
+                    prev_best = self.s.best_lap_str.get(num)
+                    if not prev_best or ms < time_to_ms(prev_best):
+                        self.s.best_lap_str[num] = last_time
+            if pos and pos.isdigit():
+                self.s.order_pos[num] = int(pos)
+            if status:
+                self.s.status_by_num[num] = status
 
-        elif tag == "$J" and len(f) >= 3:
-            # $J,"<number>","<best>","<last>"
-            number = f[1].strip('"')
-            best = parseTimeSTR(f[2])
-            if best is not None:
-                cur = self.s.best_lap.get(number)
-                self.s.best_lap[number] = min(best, cur) if cur is not None else best
+        elif tag == "$J":
+            # $J,"<num>","<best>","<last>"
+            num = get(0, "").strip().strip('"')
+            best = get(1, "").strip().strip('"')
+            if num and best:
+                ms = time_to_ms(best)
+                if ms >= MIN_VALID_LAP_MS:
+                    prev = self.s.best_lap_str.get(num)
+                    if not prev or ms < time_to_ms(prev):
+                        self.s.best_lap_str[num] = best
+
+        # try committing window after each line
+        self._maybe_commit_window()
 
 # ---------------------- DB ingest ----------------------
 
@@ -264,7 +429,6 @@ class DBIngestor:
                         db.flush()
                 return ev
 
-        # no cached event; try by final name if present
         name = (s.event_name or "").strip()
         if name:
             ev = db.query(Event).filter(Event.name == name).one_or_none()
@@ -285,14 +449,13 @@ class DBIngestor:
         if self.current_class_id:
             rc = db.get(RaceClass, self.current_class_id)
             if rc:
-                target = (class_name or "").strip()
+                target = (class_name or "").strip() or "Unknown Class"
                 if target and rc.name != target:
                     existing = db.query(RaceClass).filter(
                         RaceClass.event_id == event_id, RaceClass.name == target
                     ).one_or_none()
                     if existing and existing.id != rc.id:
-                        # merge, but avoid UNIQUE constraint violation on sessions
-                        # For each session with class_id=rc.id, check if a session with same event_id, session_name exists for existing.id
+                        # merge sessions carefully to avoid unique collisions
                         sessions_to_update = db.query(RaceSession).filter_by(class_id=rc.id).all()
                         for sess in sessions_to_update:
                             duplicate = db.query(RaceSession).filter_by(
@@ -303,7 +466,6 @@ class DBIngestor:
                             if not duplicate:
                                 sess.class_id = existing.id
                             else:
-                                # Optionally, handle merging or deleting duplicate sessions
                                 db.delete(sess)
                         db.query(Entry).filter_by(class_id=rc.id).update({"class_id": existing.id})
                         db.flush()
@@ -376,8 +538,7 @@ class DBIngestor:
                 chassis=driver_state.chassis,
                 transponder=driver_state.transponder or None
             )
-            db.add(driver)
-            db.flush()
+            db.add(driver); db.flush()
         else:
             changed = False
             if driver_state.first and driver.first_name != driver_state.first:
@@ -452,117 +613,130 @@ class DBIngestor:
 
     def apply(self, parsed: OrbitsParser):
         s = parsed.s
-        with self.SessionLocal() as db_session:
-            # 1) Resolve Event, Class, Session from packets (rename/merge safe)
-            ev = self.get_or_create_event(db_session, s)
-            rc = self.get_or_create_class(db_session, ev.id, s.class_name)
-            sess = self.get_or_create_session(db_session, ev.id, rc.id, s.session_name, s.session_type)
+        with self.SessionLocal() as db:
+            # 1) Resolve Event, Class, Session
+            ev = self.get_or_create_event(db, s)
+            rc = self.get_or_create_class(db, ev.id, s.class_name)
+            sess = self.get_or_create_session(db, ev.id, rc.id, s.session_name, s.session_type)
 
-            # 2) Ensure Drivers + Entries exist; build num->driver_id map
+            # 2) Ensure Drivers + Entries exist
             num_to_driver_id: Dict[str, int] = {}
             for number, driver_state in s.drivers.items():
-                drv = self.get_or_create_driver(db_session, number, driver_state)
-                self.get_or_create_entry(db_session, drv, number, ev.id, rc.id, driver_state)
+                drv = self.get_or_create_driver(db, number, driver_state)
+                self.get_or_create_entry(db, drv, number, ev.id, rc.id, driver_state)
                 num_to_driver_id[number] = drv.id
 
-            # 3) Persist laps only when feed lap_no increases and we have a last-lap time
-            for number, feed_lap_no in s.lap_no.items():
-                if number not in num_to_driver_id:
+            # 3) Persist laps when lap_no increases & delta valid (derive from last_lap_str)
+            for num, cur_no in s.lap_no.items():
+                if num not in num_to_driver_id:
                     continue
-                driver_id = num_to_driver_id[number]
-                last_saved = self._last_saved_lap(db_session, sess.id, driver_id, number)
-                if feed_lap_no <= last_saved:
+                driver_id = num_to_driver_id[num]
+                last_saved = self._last_saved_lap(db, sess.id, driver_id, num)
+                if cur_no <= last_saved:
                     continue
-                last_sec = s.last_lap.get(number)
-                last_ms = to_ms(last_sec) if last_sec is not None else None
-                if last_ms is None:
-                    continue
-                for ln in range(last_saved + 1, feed_lap_no + 1):
-                    db_session.add(
-                        Lap(
+
+                # derive lap time from g-cross delta if available
+                # fallback to last_lap_str (already floor-filtered)
+                if s.g_last_cross_lap.get(num) is not None and s.g_last_cross_ms.get(num) is not None:
+                    # When lap increased, we should have set last_lap_str[num]; look it up:
+                    lap_str = s.last_lap_str.get(num, "")
+                    ms = time_to_ms(lap_str) if lap_str else 10**12
+                else:
+                    ms = time_to_ms(s.last_lap_str.get(num, ""))
+
+                if ms >= MIN_VALID_LAP_MS and ms < 15 * 60 * 1000:
+                    for ln in range(last_saved + 1, cur_no + 1):
+                        db.add(Lap(
                             session_id=sess.id,
                             driver_id=driver_id,
                             lap_number=ln,
-                            lap_time_ms=last_ms,
+                            lap_time_ms=ms,
                             timestamp=datetime.now(timezone.utc),
-                            is_valid=1,
-                        )
-                    )
-                self.saved_lap_no[number] = feed_lap_no
+                            is_valid=1
+                        ))
+                    self.saved_lap_no[num] = cur_no
+                else:
+                    # invalid → do not persist; keep saved_lap_no unchanged
+                    pass
 
-            # 4) Upsert results per session type
-            # Build "ordered" list and "best laps" map
-            ordered_nums = [c for c in s.order if c and c in num_to_driver_id]
-            best_map_ms: Dict[str, int] = {}
-            for num, sec in s.best_lap.items():
-                if sec is not None:
-                    best_map_ms[num] = to_ms(sec)  # type: ignore
-
-            # Global fastest best lap for gap (P/Q)
-            fastest_best_ms = min(best_map_ms.values()) if best_map_ms else None
+            # 4) Upsert results
+            # Prepare best map (ms)
+            best_ms_by_num: Dict[str, int] = {}
+            for n, t in s.best_lap_str.items():
+                ms = time_to_ms(t)
+                if ms < 10**12:
+                    best_ms_by_num[n] = ms
+            fastest_ms = min(best_ms_by_num.values()) if best_ms_by_num else None
 
             def upsert(num: str, position: Optional[int]):
                 driver_id = num_to_driver_id[num]
-                result = self.get_or_create_result(db_session, sess.id, driver_id)
+                res = self.get_or_create_result(db, sess.id, driver_id)
 
-                last_ms = to_ms(s.last_lap.get(num))
-                best_ms = best_map_ms.get(num)
+                # last/best
+                last_ms = time_to_ms(s.last_lap_str.get(num, "")); last_ms = None if last_ms >= 10**12 else last_ms
+                best_ms = best_ms_by_num.get(num)
 
-                result.position = position
-                result.last_lap_ms = last_ms
+                res.position = position
+                res.last_lap_ms = last_ms
+                if best_ms is not None and (res.best_lap_ms is None or best_ms < res.best_lap_ms):
+                    res.best_lap_ms = best_ms
 
-                if best_ms is not None and (result.best_lap_ms is None or best_ms < result.best_lap_ms):
-                    result.best_lap_ms = best_ms
+                # status mapping (0=OK, 1=DNF, 2=DNS, 3=DQ)
+                st = s.status_by_num.get(num, "0")
+                if st == "1":
+                    res.status_code = "DNF"
+                elif st == "2":
+                    res.status_code = "DNS"
+                elif st == "3":
+                    res.status_code = "DQ"
+                else:
+                    res.status_code = None
 
                 if sess.session_type in ("Practice", "Qualifying"):
-                    if fastest_best_ms is not None and result.best_lap_ms is not None:
-                        result.gap_to_p1_ms = max(0, result.best_lap_ms - fastest_best_ms)
+                    if fastest_ms is not None and res.best_lap_ms is not None:
+                        res.gap_to_p1_ms = max(0, res.best_lap_ms - fastest_ms)
                     else:
-                        result.gap_to_p1_ms = None
+                        res.gap_to_p1_ms = None
                 else:
-                    # race gap requires pass times/total time; leave None for now
-                    result.gap_to_p1_ms = None
+                    # Race gap requires full timing deltas; we keep None here.
+                    res.gap_to_p1_ms = None
 
             if sess.session_type in ("Practice", "Qualifying"):
-                # Rank by best lap (ascending). If best lap missing, push to bottom but
-                # keep a stable tie-break using the running order from the feed.
-                # This mirrors the behavior in logOrbits.py: b = best_ms or sentinel,
-                # tie-break by position from the feed.
-                candidates = list(num_to_driver_id.keys())
-                idx_in_order = {n: (ordered_nums.index(n) if n in ordered_nums else 10**6) for n in candidates}
+                # rank by best (asc), tiebreak by last seen $G position then number
+                nums = list(num_to_driver_id.keys())
                 SENTINEL = 10**12
-
-                # Debug inputs
-                logging.getLogger(__name__).debug(
-                    "Practice/Qual ranking inputs (pre): candidates=%s best_map_ms=%s ordered_nums=%s idx_in_order=%s",
-                    candidates, best_map_ms, ordered_nums, idx_in_order,
-                )
-
                 def key_fn(n: str):
-                    return (best_map_ms.get(n, SENTINEL), idx_in_order.get(n, 10**6), n)
-
-                ranked = sorted(candidates, key=key_fn)
-                logging.getLogger(__name__).debug("Practice/Qual ranked order: %s", ranked)
-                # Assign contiguous positions to all candidates (matching logOrbits behavior)
+                    b = best_ms_by_num.get(n, SENTINEL)
+                    p = s.order_pos.get(n, 99999)
+                    return (b, p, n)
+                ranked = sorted(nums, key=key_fn)
                 for pos, n in enumerate(ranked, start=1):
                     upsert(n, pos)
             else:
-                # Heat / Prefinal / Final => position by leader on track
-                # Determine candidates (all known numbers) and stable index from current order
-                candidates = list(num_to_driver_id.keys())
-                idx_in_order = {n: (ordered_nums.index(n) if n in ordered_nums else 10**6) for n in candidates}
-                # lap numbers from feed (higher lap_no -> ahead on track)
-                lap_no_map = {n: s.lap_no.get(n, 0) for n in candidates}
+                # Race: if no committed order yet, approximate like logOrbits fallback
+                if not s.display_order:
+                    approx = list(num_to_driver_id.keys())
+                    def approx_key(n: str) -> Tuple[int, int, int, str]:
+                        laps = s.lap_no.get(n, 0)
+                        pos = s.order_pos.get(n, 99999)
+                        cross = s.g_last_cross_ms.get(n, 10**12)
+                        return (-laps, pos, cross, n)
+                    approx.sort(key=approx_key)
+                    s.display_order = approx
 
-                # Sort by: most laps completed (desc), then running order index (asc), then driver number
-                def race_key(n: str):
-                    return (-lap_no_map.get(n, 0), idx_in_order.get(n, 10**6), n)
-
-                ranked = sorted(candidates, key=race_key)
-                for pos, n in enumerate(ranked, start=1):
+                for pos, n in enumerate(s.display_order, start=1):
                     upsert(n, pos)
 
-            db_session.commit()
+            db.commit()
+
+            # 5) Optionally flip to provisional on checker
+            flag = (parsed.s.flag or "").strip().lower()
+            if flag in CHECKERED_STRINGS:
+                if sess and sess.status != "provisional":
+                    sess.status = "provisional"
+                    if not sess.ended_at:
+                        sess.ended_at = datetime.now(timezone.utc)
+                    db.commit()
 
 # ---------------------- TCP Reader ----------------------
 
@@ -590,7 +764,6 @@ class OrbitsTCPReader:
         self._stop = True
 
     def run(self):
-        import time
         backoff = 1.0
         while not self._stop:
             sock = None
@@ -611,25 +784,11 @@ class OrbitsTCPReader:
                     self.parser.parseLine(line)
                     self.ingestor.apply(self.parser)
 
-                    # Optional: flip to provisional on checker (if you want it here)
-                    flag = (self.parser.s.flag or "").strip().lower()
-                    if flag in CHECKERED_STRINGS:
-                        sid = getattr(self.ingestor, "_last_session_id", None)
-                        if sid:
-                            with SessionLocal() as db:
-                                sess = db.get(RaceSession, sid)
-                                if sess and sess.status != "provisional":
-                                    sess.status = "provisional"
-                                    if not sess.ended_at:
-                                        sess.ended_at = datetime.now(timezone.utc)
-                                    db.commit()
-
             except (socket.timeout, ConnectionError, OSError) as e:
                 logging.getLogger(__name__).debug("Socket/connect/read error: %s", e)
                 time.sleep(backoff)
                 backoff = min(self.max_backoff, backoff * 2)
             except Exception:
-                # Catch-all to prevent silent crashes — log and retry with backoff
                 logging.getLogger(__name__).exception("Uncaught exception in OrbitsTCPReader; will retry")
                 time.sleep(backoff)
                 backoff = min(self.max_backoff, backoff * 2)
@@ -655,7 +814,7 @@ def main():
     args = ap.parse_args()
 
     parser = OrbitsParser()
-    ingestor = DBIngestor(SessionLocal)  # zero-arg IDs; resolved from packets
+    ingestor = DBIngestor(SessionLocal)  # resolved from packets
 
     logging.info("Starting Orbits TCP reader on %s:%s", args.host, args.port)
     OrbitsTCPReader(
@@ -667,7 +826,6 @@ def main():
         read_timeout=5.0,
         max_backoff=10.0,
     ).run()
-
 
 if __name__ == "__main__":
     main()
