@@ -530,6 +530,8 @@ class DBIngestor:
         self.current_event_id: Optional[int] = None
         self.current_class_id: Optional[int] = None
         self._last_session_id: Optional[int] = None
+        # throttle live publishing (seconds)
+        self._last_live_publish: float = 0.0
 
     # ---- Event/Class with safe rename/merge ----
 
@@ -884,6 +886,23 @@ class DBIngestor:
                     if not sess.ended_at:
                         sess.ended_at = datetime.now(timezone.utc)
                     db.commit()
+
+            # Live publishing of provisional heat points (throttled ~1s)
+            try:
+                from sn28_config import CFG as _CFG
+                if getattr(_CFG.app, "publish_points", False):
+                    now = time.time()
+                    if now - self._last_live_publish >= 1.0:
+                        # import locally to avoid circular imports at module load
+                        try:
+                            from sheets_publish import publish_live_heat_points
+                            publish_live_heat_points(sess.id)
+                        except Exception:
+                            # don't let publishing failures interrupt ingest
+                            pass
+                        self._last_live_publish = now
+            except Exception:
+                pass
 
 # ---------------------- TCP Reader ----------------------
 

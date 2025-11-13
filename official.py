@@ -11,6 +11,8 @@ from models import (
     BasisEnum, SessionTypeEnum, Point, PointScale, PointAward
 )
 
+from sn28_config import CFG
+
 # ---------- Lightweight result view used for preview ----------
 @dataclass
 class ResultView:
@@ -256,6 +258,110 @@ def write_official_and_award_points(db: Session, session_id: int, scheme_name: s
         _award_points_for_session(db, sess, preview, scheme_name, next_ver, award_type="Heat")
 
     db.commit()
+
+
+def compute_provisional_heat_points(db: Session, session_id: int, scheme_name: Optional[str] = None, persist: bool = False) -> List[Dict]:
+    """
+    Compute provisional heat/qualifying points for a session using the same
+    penalty application logic as compute_official_order.
+
+    Returns a list of dicts:
+      {driver_id, position, base_points, bonus_points, total_points, class_id, event_id}
+
+    If `persist` is True, writes a new provisional PointAward version into the DB
+    using the provided session-scoped transaction (db).
+    """
+    scheme = scheme_name or CFG.app.points_scheme
+    sess = db.get(RaceSession, session_id)
+    if not sess:
+        return []
+
+    # Compute preview (penalty applied)
+    preview = compute_official_order(db, session_id)
+
+    # Determine award type for scale lookup
+    sname = (sess.session_name or "")
+    is_heat_by_name = ("heat" in sname.lower())
+    if sess.session_type == "Qualifying":
+        award_type = "Qualifying"
+    elif is_heat_by_name or sess.session_type == "Heat":
+        award_type = "Heat"
+    else:
+        # Default to Heat semantics for points if not explicit
+        award_type = "Heat"
+
+    # Find point scheme
+    pt = db.query(Point).filter(Point.name == scheme).first()
+    if not pt:
+        # attempt lazy seed
+        try:
+            from points_config import seed_skusa_sn28  # local import
+            seed_skusa_sn28()
+            db.flush()
+        except Exception:
+            pass
+        pt = db.query(Point).filter(Point.name == scheme).first()
+        if not pt:
+            # cannot compute points without a scheme
+            out = []
+            for rv in preview:
+                out.append({
+                    "driver_id": rv.driver_id,
+                    "position": rv.position,
+                    "base_points": 0,
+                    "bonus_points": 0,
+                    "total_points": 0,
+                    "class_id": sess.class_id,
+                    "event_id": sess.event_id,
+                })
+            return out
+
+    scales = db.query(PointScale).filter(PointScale.point_id == pt.id, PointScale.session_type == award_type).all()
+    pos_to_pts = {s.position: s.points for s in scales}
+
+    out: List[Dict] = []
+    for rv in preview:
+        if rv.position is None or (rv.status_code == "DQ"):
+            base = 0
+        else:
+            base = pos_to_pts.get(rv.position, 0)
+        bonus = 0
+        total = (base or 0) + (bonus or 0)
+        out.append({
+            "driver_id": rv.driver_id,
+            "position": rv.position,
+            "base_points": int(base or 0),
+            "bonus_points": int(bonus),
+            "total_points": int(total),
+            "class_id": sess.class_id,
+            "event_id": sess.event_id,
+        })
+
+    if persist:
+        # Compute next provisional version
+        ver_row = (
+            db.query(PointAward.version)
+              .filter(PointAward.session_id == session_id, PointAward.basis == "provisional")
+              .order_by(PointAward.version.desc())
+              .first()
+        )
+        next_ver = 1 if not ver_row else (ver_row[0] + 1)
+        # Persist PointAward rows for this provisional snapshot
+        for row in out:
+            pa = PointAward(
+                session_id=session_id,
+                driver_id=row["driver_id"],
+                basis="provisional",
+                version=next_ver,
+                position=row["position"],
+                base_points=row["base_points"],
+                bonus_points=row["bonus_points"],
+                total_points=row["total_points"],
+            )
+            db.add(pa)
+        db.flush()
+
+    return out
 
 def _award_points_for_session(db: Session, sess: RaceSession, preview: List[ResultView], scheme_name: str, version: int, award_type: str) -> None:
     """

@@ -16,6 +16,8 @@ from models import (
     Result, Driver, Entry,
     PointAward, Point, PointScale,
 )
+from official import compute_provisional_heat_points
+from sn28_config import CFG
 
 # =========================
 # Google Sheets plumbing
@@ -277,6 +279,93 @@ def publish_heat_points(session_id: int) -> None:
     ws.clear()
     if rows:
         ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+
+
+def publish_live_heat_points(session_id: int) -> None:
+    """
+    Publish a single Live_HeatPoints tab that contains provisional live points
+    for the given session_id. This merges/upserts rows for this session only
+    so other sessions/classes remain untouched in the tab.
+    """
+    if not CFG.app.publish_points:
+        return
+
+    sh = _open_sheet()
+    tab = "Live_HeatPoints"
+    ws = _safe_ws(sh, tab, rows=1000, cols=18)
+
+    with SessionLocal() as db:
+        sess = _get_session(db, session_id)
+        prov = compute_provisional_heat_points(db, session_id)
+
+        class_name = getattr(sess.race_class, "name", "") if sess else ""
+        ver = None
+        now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        header = [
+            "EventID","ClassID","Class","SessionID","SessionType","SessionName",
+            "Basis","Version","DriverID","Pos","Number","First","Last","Base","Bonus","Total","UpdatedUTC"
+        ]
+
+        rows: List[List[Any]] = []
+        for r in prov:
+            driver = db.get(Driver, r["driver_id"]) if r.get("driver_id") else None
+            # resolve number
+            number = ""
+            if driver and sess:
+                for e in driver.entries:
+                    if e.event_id == sess.event_id and e.class_id == sess.class_id:
+                        number = e.number or ""
+                        break
+            rows.append([
+                sess.event_id if sess else None,
+                sess.class_id if sess else None,
+                class_name,
+                sess.id if sess else None,
+                sess.session_type if sess else "",
+                (sess.session_name or "") if sess else "",
+                "provisional",
+                ver or "",
+                r.get("driver_id"),
+                r.get("position") or "",
+                number,
+                getattr(driver, "first_name", "") if driver else "",
+                getattr(driver, "last_name", "") if driver else "",
+                r.get("base_points", 0),
+                r.get("bonus_points", 0),
+                r.get("total_points", 0),
+                now_utc,
+            ])
+
+    # Merge/update: keep existing rows not matching this session+class, replace matching ones
+    try:
+        existing = ws.get_all_values()
+    except Exception:
+        existing = []
+
+    new_body: List[List[Any]] = []
+    session_label = f"{sess.session_type} - {sess.session_name or ''}" if sess else ""
+    cls_name = class_name
+    if existing:
+        # preserve header
+        existing_header = existing[0]
+        new_body.append(existing_header if existing_header else header)
+        for row in existing[1:]:
+            r_class = row[2] if len(row) > 2 else ""
+            r_session = row[3] if len(row) > 3 else ""
+            # keep rows that are not for this session_id (SessionID column at index 3)
+            if str(r_session) != str(sess.id):
+                new_body.append(row)
+    else:
+        new_body.append(header)
+
+    # append our rows
+    for r in rows:
+        new_body.append(r)
+
+    if new_body:
+        ws.clear()
+        ws.update(range_name="A1", values=new_body, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
 
 def publish_prefinal_grid(class_id: int, event_id: int) -> None:
     """
