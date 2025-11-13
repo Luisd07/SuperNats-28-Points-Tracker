@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 import csv
+import re
 import time
 import socket
 from datetime import datetime, timezone, date
@@ -20,12 +21,11 @@ from models import (
 )
 
 # ==========================
-# Tunables (match logOrbits)
+# Tunables
 # ==========================
 MIN_VALID_LAP_MS = 30_000       # ignore < 30.000s (spikes / pits / noise)
 CROSS_WINDOW_MS = 1100          # window to collect same-lap $G lines after leader
 SAME_LAP_GRACE_WINDOWS = 1      # grace windows for unseen-but-same-lap drivers
-
 CHECKERED_STRINGS = {"checkered", "chequered", "finish", "finished", "chequer", "check"}
 
 # Exposed handles if you embed in threads
@@ -71,28 +71,42 @@ def parseTimeSTR(s: str) -> Optional[float]:
 def to_ms(seconds: Optional[float]) -> Optional[int]:
     return int(round(seconds * 1000)) if seconds is not None else None
 
+# ---------------------- Session / Class helpers ----------------------
+
 def lock_session_type(name: str) -> str:
     n = (name or "").lower()
-
-    # Highest confidence: explicit words
-    if "practice" in n or "warm" in n or "happy hour" in n:
-        return "Practice"
-    if "qualifying" in n or "super pole" in n or "superpole" in n:
+    if any(k in n for k in ("q1", "q2", "q3", "quali", "qual.", "super pole", "superpole")):
+        return "Qualifying"
+    if "qual" in n:
         return "Qualifying"
     if "heat" in n:
         return "Heat"
-    if "pre-final" in n or "prefinal" in n or "pre final" in n:
+    if "prefinal" in n or "pre-final" in n or "pre final" in n:
         return "Prefinal"
-    # "Final" must not steal 'Final Practice'
-    if "final" in n and "practice" not in n:
+    if "final" in n or "main event" in n or n.strip() == "final":
         return "Final"
+    if "practice" in n or "happy hour" in n or "warm" in n:
+        return "Practice"
+    return "Practice"  # default to safe PQ behavior rather than race
 
-    # Lower confidence shorthands (apply only if above didn’t match)
-    if any(k in n for k in (" q1", " q2", " q3", "-q1", "-q2", "-q3", "(q1)", "(q2)", "(q3)", " quali", " qual.")):
-        return "Qualifying"
+GROUP_PAT = re.compile(r'\b(?:group|grp|q)\s*([12ab])\b', re.IGNORECASE)
 
-    # Safe default that preserves best-lap ranking
-    return "Practice"
+def strip_group_token(name: str) -> str:
+    if not name:
+        return name
+    n = GROUP_PAT.sub('', name)
+    n = re.sub(r'\s*[-–]\s*$', '', n).strip()
+    n = re.sub(r'\s{2,}', ' ', n)
+    return n
+
+def extract_group(name: str) -> Optional[str]:
+    if not name:
+        return None
+    m = GROUP_PAT.search(name)
+    if not m:
+        return None
+    g = m.group(1).upper()
+    return {'1': 'Q1', '2': 'Q2', 'A': 'Q1', 'B': 'Q2'}.get(g, f'Q{g}')
 
 # ---------------------- In-memory live state ----------------------
 
@@ -110,6 +124,7 @@ class DriverState:
 class TimingState:
     session_name: str = ""
     session_type: str = ""
+    session_group: Optional[str] = None  # Q1/Q2 if present
     class_name: str = ""
     event_name: str = ""
     track_name: str = ""
@@ -123,11 +138,11 @@ class TimingState:
     order_pos: Dict[str, int] = field(default_factory=dict)       # last seen $G position
     status_by_num: Dict[str, str] = field(default_factory=dict)   # 0/1/2/3
 
-    # $G crossing bookkeeping (from session elapsed)
+    # $G crossing bookkeeping
     g_last_cross_ms: Dict[str, int] = field(default_factory=dict)
     g_last_cross_lap: Dict[str, int] = field(default_factory=dict)
 
-    # race commit model (crossing window)
+    # race commit model
     display_order: List[str] = field(default_factory=list)
     leader_lap: int = 0
     window_active: bool = False
@@ -157,6 +172,7 @@ class TimingState:
         self.win_cross_ms.clear()
         self.win_seen.clear()
         self.missed_windows_same_lap.clear()
+        self.session_group = None
 
 # ---------------------- Orbits feed parser ----------------------
 
@@ -211,14 +227,11 @@ class OrbitsParser:
             if laps >= target_lap:
                 if self.s.win_seen.get(num, False):
                     posk = self.s.win_pos.get(num, 99999)
-                    grace_pen = 0
                 else:
                     missed = self.s.missed_windows_same_lap.get(num, 0)
-                    grace_pen = 0 if missed < SAME_LAP_GRACE_WINDOWS else 1
-                    posk = 99998 + grace_pen
+                    posk = 99998 if missed < SAME_LAP_GRACE_WINDOWS else 99999
             else:
                 posk = 99999
-                grace_pen = 0
 
             cross = self.s.win_cross_ms.get(num, self.s.g_last_cross_ms.get(num, 10**12))
             try:
@@ -252,26 +265,21 @@ class OrbitsParser:
         def get(i: int, default: str = "") -> str:
             return f[i] if i < len(f) else default
 
-        # --- $B handler (drop the quoted_fields logic) ---
         if tag == "$B":
-            # Examples: $B,43,"Practice 1 - P1"  |  $B,,"Qualifying 2"
-            # Pick the last non-empty field after $B.
-            new_name = ""
-            for x in reversed(f):
-                x = x.strip()
-                if x:
-                    new_name = x
-                    break
+            # $B,43,"Practice 1 - P1"   or   $B,,"Qualifying 2"
+            quoted_fields = [x for x in f if x.strip().startswith('"') and x.strip().endswith('"')]
+            new_name = (quoted_fields[-1] if quoted_fields else (f[1] if len(f) > 1 else "")).strip()
             if new_name:
+                new_name = new_name.strip('"')
                 if new_name != self.s.session_name:
                     self.s.reset_for_new_session()
                 self.s.session_name = new_name
                 self.s.session_type = lock_session_type(self.s.session_name)
-
-
+                self.s.session_group = extract_group(self.s.session_name)
 
         elif tag == "$C":
-            self.s.class_name = get(1, "").strip().strip('"')
+            raw = get(1, "").strip().strip('"')
+            self.s.class_name = strip_group_token(raw)
 
         elif tag == "$E":
             key = get(0, "").strip().strip('"').upper()
@@ -323,7 +331,6 @@ class OrbitsParser:
         elif tag == "$F":
             # $F,9999,"00:01:16","16:45:26","00:06:43","Green "
             self.s.flag = get(4, get(5, "")).strip().strip('"')
-            # Provisional flip is handled in DB ingest after commit.
 
         elif tag == "$G":
             # $G, <pos>, "<num>", <lap_no>, "<session_elapsed>"
@@ -349,7 +356,6 @@ class OrbitsParser:
                     if prev_lap is not None and prev_ms is not None and cur_lap > prev_lap:
                         delta = cur_ms - prev_ms
                         if MIN_VALID_LAP_MS <= delta < 15 * 60 * 1000:
-                            # derive LAST + update BEST if improved
                             mm = delta // 60000
                             ss = (delta // 1000) % 60
                             ms = delta % 1000
@@ -358,7 +364,6 @@ class OrbitsParser:
                             prev_best = self.s.best_lap_str.get(num)
                             if not prev_best or delta < time_to_ms(prev_best):
                                 self.s.best_lap_str[num] = lap_str
-                    # update crossing refs
                     self.s.g_last_cross_lap[num] = cur_lap
                     self.s.g_last_cross_ms[num] = cur_ms
 
@@ -414,17 +419,15 @@ def _merge_class_into(db: Session, src: RaceClass, dst: RaceClass) -> None:
     """Move Sessions + Entries from src class to dst class, deduping on unique keys."""
     from models import Entry, Session as RaceSession, Lap, Result, Penalty
 
-    # Entries: prefer keeping any dst row for the same driver; else resolve by number
+    # Entries
     src_entries = db.query(Entry).filter(Entry.class_id == src.id).all()
     for e in src_entries:
-        # same driver already present in dst?
         keep = (db.query(Entry)
                   .filter(Entry.event_id == e.event_id,
                           Entry.class_id == dst.id,
                           Entry.driver_id == e.driver_id)
                   .one_or_none())
         if keep:
-            # enrich the kept row then drop the src row
             if not keep.number and e.number: keep.number = e.number
             if not keep.team and e.team: keep.team = e.team
             if not keep.chassis and e.chassis: keep.chassis = e.chassis
@@ -432,7 +435,6 @@ def _merge_class_into(db: Session, src: RaceClass, dst: RaceClass) -> None:
             db.delete(e)
             continue
 
-        # number collision?
         if e.number:
             collide = (db.query(Entry)
                          .filter(Entry.event_id == e.event_id,
@@ -443,12 +445,11 @@ def _merge_class_into(db: Session, src: RaceClass, dst: RaceClass) -> None:
                 db.delete(e)
                 continue
 
-        # safe to repoint
         e.class_id = dst.id
 
     db.flush()
 
-    # Sessions: repoint children or merge into twin session, then delete
+    # Sessions
     src_sessions = db.query(RaceSession).filter(RaceSession.class_id == src.id).all()
     for s in src_sessions:
         twin = (db.query(RaceSession)
@@ -473,7 +474,7 @@ def _merge_event_into(db: Session, src: Event, dst: Event) -> None:
     """Move Classes/Sessions/Entries from src event to dst event, deduping on unique keys."""
     from models import RaceClass, Session as RaceSession, Entry, Lap, Result, Penalty
 
-    # Classes: if a class with same name exists on dst, merge class rows; else repoint
+    # Classes
     src_classes = db.query(RaceClass).filter(RaceClass.event_id == src.id).all()
     for c in src_classes:
         twin = (db.query(RaceClass)
@@ -491,7 +492,7 @@ def _merge_event_into(db: Session, src: Event, dst: Event) -> None:
     for s in src_sessions:
         s.event_id = dst.id
 
-    # Entries (defensive): dedupe by (event,class,driver) and by (event,class,number)
+    # Entries (defensive)
     src_entries = db.query(Entry).filter(Entry.event_id == src.id).all()
     for e in src_entries:
         e.event_id = dst.id
@@ -575,7 +576,7 @@ class DBIngestor:
         return ev
 
     def get_or_create_class(self, db: Session, event_id: int, class_name: str) -> RaceClass:
-        name = (class_name or "").strip() or "Unknown Class"
+        name = strip_group_token(class_name) or "Unknown Class"
 
         if self.current_class_id:
             rc = db.get(RaceClass, self.current_class_id)
@@ -593,6 +594,14 @@ class DBIngestor:
         rc = (db.query(RaceClass)
                 .filter(RaceClass.event_id == event_id, RaceClass.name == name)
                 .one_or_none())
+        if not rc and class_name.strip() and class_name.strip() != name:
+            # try raw legacy row and rename it to normalized to prevent future dups
+            rc = (db.query(RaceClass)
+                    .filter(RaceClass.event_id == event_id, RaceClass.name == class_name.strip())
+                    .one_or_none())
+            if rc:
+                rc.name = name
+                db.flush()
         if not rc:
             rc = RaceClass(event_id=event_id, name=name)
             db.add(rc); db.flush()
@@ -603,8 +612,10 @@ class DBIngestor:
     # ---- Session ----
 
     def get_or_create_session(self, db: Session, event_id: int, class_id: int,
-                              session_name: str, session_type: str) -> RaceSession:
-        name = session_name or session_type or "Session"
+                              session_name: str, session_type: str, group_tag: Optional[str]) -> RaceSession:
+        base = (session_name or session_type or "Session").strip()
+        name = f"{base} [{group_tag}]" if (session_type == "Qualifying" and group_tag) else base
+
         sess = db.query(RaceSession).filter(
             RaceSession.event_id == event_id,
             RaceSession.class_id == class_id,
@@ -730,7 +741,7 @@ class DBIngestor:
             # 1) Resolve Event, Class, Session
             ev = self.get_or_create_event(db, s)
             rc = self.get_or_create_class(db, ev.id, s.class_name)
-            sess = self.get_or_create_session(db, ev.id, rc.id, s.session_name, s.session_type)
+            sess = self.get_or_create_session(db, ev.id, rc.id, s.session_name, s.session_type, s.session_group)
 
             # 2) Ensure Drivers + Entries exist
             num_to_driver_id: Dict[str, int] = {}
@@ -776,7 +787,22 @@ class DBIngestor:
                 ms = time_to_ms(t)
                 if ms < 10**12:
                     best_ms_by_num[n] = ms
-            fastest_ms = min(best_ms_by_num.values()) if best_ms_by_num else None
+
+            # session-fastest for Practice; class-fastest across all Qualifying sessions for this class
+            session_fastest_ms = min(best_ms_by_num.values()) if best_ms_by_num else None
+            class_fastest_ms = None
+            if sess.session_type == "Qualifying":
+                class_fastest_ms = (
+                    db.query(func.min(Result.best_lap_ms))
+                      .join(RaceSession, Result.session_id == RaceSession.id)
+                      .filter(
+                          RaceSession.event_id == ev.id,
+                          RaceSession.class_id == rc.id,
+                          RaceSession.session_type == "Qualifying",
+                          Result.best_lap_ms.isnot(None),
+                      )
+                      .scalar()
+                )
 
             def upsert(num: str, position: Optional[int]):
                 driver_id = num_to_driver_id[num]
@@ -800,13 +826,17 @@ class DBIngestor:
                 else:
                     res.status_code = None
 
-                if sess.session_type in ("Practice", "Qualifying"):
-                    if fastest_ms is not None and res.best_lap_ms is not None:
-                        res.gap_to_p1_ms = max(0, res.best_lap_ms - fastest_ms)
-                    else:
-                        res.gap_to_p1_ms = None
+                if sess.session_type == "Qualifying":
+                    ref = class_fastest_ms
+                elif sess.session_type == "Practice":
+                    ref = session_fastest_ms
                 else:
-                    res.gap_to_p1_ms = None  # race gap handled elsewhere if needed
+                    ref = None
+
+                if ref is not None and res.best_lap_ms is not None:
+                    res.gap_to_p1_ms = max(0, res.best_lap_ms - ref)
+                else:
+                    res.gap_to_p1_ms = None
 
             if sess.session_type in ("Practice", "Qualifying"):
                 # rank by best (asc), tiebreak by last $G position then number
@@ -820,7 +850,7 @@ class DBIngestor:
                 for pos, n in enumerate(ranked, start=1):
                     upsert(n, pos)
             else:
-                # Race: use committed display_order; if none, approximate like logOrbits
+                # Race: use committed display_order; if none, approximate
                 if not s.display_order:
                     approx = list(num_to_driver_id.keys())
                     def approx_key(n: str) -> Tuple[int, int, int, str]:
