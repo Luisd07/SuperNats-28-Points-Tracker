@@ -71,24 +71,28 @@ def parseTimeSTR(s: str) -> Optional[float]:
 def to_ms(seconds: Optional[float]) -> Optional[int]:
     return int(round(seconds * 1000)) if seconds is not None else None
 
-# --- replace your lock_session_type with this ---
 def lock_session_type(name: str) -> str:
     n = (name or "").lower()
-    # common shorthands
-    if any(k in n for k in ("q1", "q2", "q3", "quali", "qual.", "super pole", "superpole")):
-        return "Qualifying"
-    if "qual" in n:
+
+    # Highest confidence: explicit words
+    if "practice" in n or "warm" in n or "happy hour" in n:
+        return "Practice"
+    if "qualifying" in n or "super pole" in n or "superpole" in n:
         return "Qualifying"
     if "heat" in n:
         return "Heat"
-    if "prefinal" in n or "pre-final" in n or "pre final" in n:
+    if "pre-final" in n or "prefinal" in n or "pre final" in n:
         return "Prefinal"
-    if "final" in n or "main event" in n or n.strip() == "final":
+    # "Final" must not steal 'Final Practice'
+    if "final" in n and "practice" not in n:
         return "Final"
-    if "practice" in n or "happy hour" in n or "warm" in n:
-        return "Practice"
-    return "Practice"  # default to safe PQ behavior rather than race
 
+    # Lower confidence shorthands (apply only if above didn’t match)
+    if any(k in n for k in (" q1", " q2", " q3", "-q1", "-q2", "-q3", "(q1)", "(q2)", "(q3)", " quali", " qual.")):
+        return "Qualifying"
+
+    # Safe default that preserves best-lap ranking
+    return "Practice"
 
 # ---------------------- In-memory live state ----------------------
 
@@ -248,20 +252,22 @@ class OrbitsParser:
         def get(i: int, default: str = "") -> str:
             return f[i] if i < len(f) else default
 
-        # --- in OrbitsParser.parseLine, replace the $B handler with this ---
+        # --- $B handler (drop the quoted_fields logic) ---
         if tag == "$B":
-            # Formats we’ve seen:
-            #   $B,43,"Practice 1 - P1"
-            #   $B,,"Qualifying 2"
-            # Always pick the last quoted field if present.
-            quoted_fields = [x for x in f if x.strip().startswith('"') and x.strip().endswith('"')]
-            new_name = (quoted_fields[-1] if quoted_fields else (f[1] if len(f) > 1 else "")).strip()
+            # Examples: $B,43,"Practice 1 - P1"  |  $B,,"Qualifying 2"
+            # Pick the last non-empty field after $B.
+            new_name = ""
+            for x in reversed(f):
+                x = x.strip()
+                if x:
+                    new_name = x
+                    break
             if new_name:
-                new_name = new_name.strip('"')
                 if new_name != self.s.session_name:
                     self.s.reset_for_new_session()
                 self.s.session_name = new_name
                 self.s.session_type = lock_session_type(self.s.session_name)
+
 
 
         elif tag == "$C":
