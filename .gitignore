@@ -224,3 +224,5 @@ DEPLOYMENT.md
 launch_sn28.bat
 /tools
 tools/
+/test
+tests/

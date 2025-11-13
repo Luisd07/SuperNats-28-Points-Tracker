@@ -529,21 +529,53 @@ class DBIngestor:
                 candidates = list(num_to_driver_id.keys())
                 # stable index from current order for tie-break
                 idx_in_order = {n: (ordered_nums.index(n) if n in ordered_nums else 10**6) for n in candidates}
+                # Build a last-lap map (ms) to use as fallback when best lap is not present.
+                last_map_ms: Dict[str, Optional[int]] = {}
+                for n in candidates:
+                    sec = s.last_lap.get(n)
+                    last_map_ms[n] = to_ms(sec) if sec is not None else None
+
                 def key_fn(n: str):
                     bm = best_map_ms.get(n)
-                    return (bm is None, bm if bm is not None else 10**12, idx_in_order[n], n)
+                    if bm is not None:
+                        # primary: best lap ascending
+                        return (0, bm, idx_in_order[n], n)
+                    lm = last_map_ms.get(n)
+                    if lm is not None:
+                        # secondary: last lap ascending (recent lap time) to approximate running pace
+                        return (1, lm, idx_in_order[n], n)
+                    # tertiary: no times -> push to bottom, tie-break by running order then number
+                    return (2, 10**12, idx_in_order[n], n)
+
+                # Debug: log inputs used for ranking to help diagnose ordering issues
+                logging.getLogger(__name__).debug(
+                    "Practice/Qual ranking inputs: candidates=%s best_map_ms=%s last_map_ms=%s ordered_nums=%s idx_in_order=%s",
+                    candidates, best_map_ms, last_map_ms, ordered_nums, idx_in_order,
+                )
                 ranked = sorted(candidates, key=key_fn)
+                logging.getLogger(__name__).debug("Practice/Qual ranked order: %s", ranked)
                 pos = 1
                 for n in ranked:
-                    # assign a position only if the driver has a best lap
-                    assign_pos = pos if best_map_ms.get(n) is not None else None
+                    # assign a position only if the driver has a best lap or a last lap
+                    assign_pos = pos if (best_map_ms.get(n) is not None or last_map_ms.get(n) is not None) else None
                     upsert(n, assign_pos)
                     if assign_pos is not None:
                         pos += 1
             else:
-                # Heat / Prefinal / Final => position by running order
-                for idx, number in enumerate(ordered_nums, start=1):
-                    upsert(number, idx)
+                # Heat / Prefinal / Final => position by leader on track
+                # Determine candidates (all known numbers) and stable index from current order
+                candidates = list(num_to_driver_id.keys())
+                idx_in_order = {n: (ordered_nums.index(n) if n in ordered_nums else 10**6) for n in candidates}
+                # lap numbers from feed (higher lap_no -> ahead on track)
+                lap_no_map = {n: s.lap_no.get(n, 0) for n in candidates}
+
+                # Sort by: most laps completed (desc), then running order index (asc), then driver number
+                def race_key(n: str):
+                    return (-lap_no_map.get(n, 0), idx_in_order.get(n, 10**6), n)
+
+                ranked = sorted(candidates, key=race_key)
+                for pos, n in enumerate(ranked, start=1):
+                    upsert(n, pos)
 
             db_session.commit()
 
