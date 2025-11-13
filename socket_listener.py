@@ -7,6 +7,7 @@ import csv
 import re
 import time
 import socket
+
 from datetime import datetime, timezone, date
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -15,10 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from db import SessionLocal, init_db
-from models import (
-    Base, Driver, Event, RaceClass, Session as RaceSession, Entry, Lap, Result,
-    BasisEnum, SessionTypeEnum, Penalty
-)
+from models import Driver, Event, RaceClass, Session as RaceSession, Entry, Lap, Result
 
 # ==========================
 # Tunables
@@ -75,11 +73,9 @@ def to_ms(seconds: Optional[float]) -> Optional[int]:
 
 def lock_session_type(name: str) -> str:
     n = (name or "").lower()
-    if any(k in n for k in ("q1", "q2", "q3", "quali", "qual.", "super pole", "superpole")):
+    if "qual" in n or "qualy" in n or "qualifying" in n:
         return "Qualifying"
-    if "qual" in n:
-        return "Qualifying"
-    if "heat" in n:
+    if "heat" in n or "heats" in n:
         return "Heat"
     if "prefinal" in n or "pre-final" in n or "pre final" in n:
         return "Prefinal"
