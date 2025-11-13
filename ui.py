@@ -198,7 +198,7 @@ class PenaltyApp(tk.Tk):
         ttk.Label(self.prov_frame, text="Provisional (latest)").pack(anchor="w")
         self.prov_tv = ttk.Treeview(self.prov_frame, columns=("pos","num","name","best","last"),
                                     show="headings", height=20)
-        for c, w in [("pos",50),("num",70),("name",260),("best",90),("last",90)]:
+        for c, w in [("pos",50),("num",70),("name",150),("best",90),("last",90)]:
             self.prov_tv.heading(c, text=c.upper())
             # Default widths; we'll autosize after filling data
             self.prov_tv.column(c, width=w, anchor="w", stretch=(c == "name"))
@@ -271,7 +271,7 @@ class PenaltyApp(tk.Tk):
         ttk.Label(self.prev_frame, text="Preview: Official (after penalties)").pack(anchor="w")
         self.prev_tv = ttk.Treeview(self.prev_frame, columns=("pos","num","name","best","last"),
                                     show="headings", height=20)
-        for c, w in [("pos",50),("num",70),("name",260),("best",90),("last",90)]:
+        for c, w in [("pos",50),("num",70),("name",150),("best",90),("last",90)]:
             self.prev_tv.heading(c, text=c.upper())
             self.prev_tv.column(c, width=w, anchor="w", stretch=(c == "name"))
         self.prev_tv.pack(fill="both", expand=True)
@@ -483,6 +483,12 @@ class PenaltyApp(tk.Tk):
             except Exception:
                 pass
             self.stop_listener()
+            # ensure background publishers drain before exit
+            try:
+                from socket_listener import stop_publish_worker
+                stop_publish_worker(timeout=3.0)
+            except Exception:
+                pass
         except Exception:
             pass
         self.destroy()

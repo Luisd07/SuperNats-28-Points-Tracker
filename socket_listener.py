@@ -6,6 +6,8 @@ import logging
 import csv
 import re
 import time
+import threading
+import queue
 import socket
 
 from datetime import datetime, timezone, date
@@ -30,6 +32,168 @@ CHECKERED_STRINGS = {"checkered", "chequered", "finish", "finished", "chequer", 
 _launched_reader: Optional[object] = None
 _launched_thread: Optional[object] = None
 
+# Background publish worker (single daemon thread)
+_publish_queue: "queue.Queue[Optional[int]]" = queue.Queue()
+_publish_worker_thread: Optional[threading.Thread] = None
+_publish_worker_lock = threading.Lock()
+_publish_stop_event: Optional[threading.Event] = None
+
+
+def _ensure_publish_worker_started() -> None:
+    """Start the background publish worker thread once (idempotent).
+
+    The worker drains session ids from _publish_queue, de-duplicates them
+    and calls sheets_publish.publish_live_heat_points(session_id). The
+    worker runs as a daemon thread and swallows exceptions to avoid
+    impacting the ingest path.
+    """
+    global _publish_worker_thread
+    if _publish_worker_thread and _publish_worker_thread.is_alive():
+        return
+
+    def _worker() -> None:
+        logger = logging.getLogger(__name__)
+        pending: set[int] = set()
+        while True:
+            try:
+                # wait up to 1s for an item
+                sid = _publish_queue.get(timeout=1.0)
+                # sentinel to wake/stop the worker
+                if sid is None:
+                    if _publish_stop_event and _publish_stop_event.is_set():
+                        break
+                    else:
+                        continue
+                pending.add(sid)
+                # drain quickly any other queued items
+                while True:
+                    try:
+                        sid2 = _publish_queue.get_nowait()
+                        if sid2 is None:
+                            # ignore sentinel
+                            continue
+                        pending.add(sid2)
+                    except queue.Empty:
+                        break
+
+                if not pending:
+                    continue
+
+                # perform publishes for pending session ids (de-duplicated)
+                for psid in list(pending):
+                    try:
+                        # import lazily to avoid circular imports during module load
+                        from sheets_publish import publish_live_heat_points
+                        publish_live_heat_points(psid)
+                    except Exception:
+                        logger.exception("publish_live_heat_points failed for session %s", psid)
+
+                # clear pending and sleep briefly to rate-limit writes
+                pending.clear()
+                time.sleep(1.0)
+
+            except queue.Empty:
+                # timeout, loop again
+                continue
+            except Exception:
+                # Log and continue if something unexpected happens
+                logging.getLogger(__name__).exception("Unexpected error in publish worker loop")
+                time.sleep(1.0)
+
+    # create/clear stop event
+    global _publish_stop_event
+    # create a fresh stop event if missing or previously set
+    if _publish_stop_event is None or (_publish_stop_event is not None and _publish_stop_event.is_set()):
+        _publish_stop_event = threading.Event()
+
+    th = threading.Thread(target=_worker, daemon=False, name="sn28-publish-worker")
+    _publish_worker_thread = th
+    th.start()
+
+
+def _enqueue_publish(session_id: int) -> None:
+    """Add a session_id to the publish queue and ensure the worker is running."""
+    try:
+        # don't enqueue if we're shutting down
+        if _publish_stop_event and _publish_stop_event.is_set():
+            return
+        _publish_queue.put(session_id)
+        with _publish_worker_lock:
+            _ensure_publish_worker_started()
+    except Exception:
+        # never raise from ingest path
+        logging.getLogger(__name__).exception("Failed to enqueue publish for session %s", session_id)
+
+
+def stop_publish_worker(timeout: float = 5.0) -> None:
+    """Stop the background publish worker, draining the queue and performing a final publish.
+
+    This function blocks up to `timeout` seconds while the worker finishes. It is safe
+    to call multiple times.
+    """
+    global _publish_stop_event, _publish_worker_thread
+    logger = logging.getLogger(__name__)
+    if _publish_stop_event is None:
+        _publish_stop_event = threading.Event()
+
+    # signal stop
+    _publish_stop_event.set()
+
+    # wake worker if it's blocked waiting
+    try:
+        _publish_queue.put(None)
+    except Exception:
+        pass
+
+    # join the worker thread
+    th = _publish_worker_thread
+    if th is None:
+        return
+    th.join(timeout)
+    if th.is_alive():
+        logger.warning("Publish worker did not stop within %s seconds", timeout)
+    else:
+        logger.debug("Publish worker stopped")
+
+    # clear thread handle
+    _publish_worker_thread = None
+    # Clear stop event so worker can be restarted later
+    global _publish_stop_event
+    _publish_stop_event = None
+
+    # perform a final synchronous drain to ensure last session publishes ran
+    try:
+        _drain_and_publish_now()
+    except Exception:
+        logger.exception("Final drain/publish failed")
+
+
+def _drain_and_publish_now() -> None:
+    """Synchronous drain of the publish queue: de-duplicate and call publisher.
+    Intended for finalization/shutdown.
+    """
+    logger = logging.getLogger(__name__)
+    sids: set[int] = set()
+    try:
+        # drain current queue non-blocking
+        while True:
+            try:
+                item = _publish_queue.get_nowait()
+                if item is None:
+                    continue
+                sids.add(int(item))
+            except queue.Empty:
+                break
+
+        for sid in list(sids):
+            try:
+                from sheets_publish import publish_live_heat_points
+                publish_live_heat_points(sid)
+            except Exception:
+                logger.exception("Final publish failed for session %s", sid)
+    except Exception:
+        logger.exception("Unexpected error draining publish queue")
+
 # ---------------------- CSV / time helpers ----------------------
 
 def parse_csv_row(line: str) -> Tuple[Optional[str], List[str]]:
@@ -48,8 +212,11 @@ def time_to_ms(s: str) -> int:
     parts = s.split(":")
     if len(parts) == 3:
         h, m, sec = parts
-    else:
+    elif len(parts) == 2:
         h, m, sec = "0", parts[0], parts[1]
+    else:
+        # unexpected format (e.g. just seconds) — treat as invalid
+        return 10**12
     if "." in sec:
         sec_i, ms = sec.split(".", 1)
     else:
@@ -169,6 +336,10 @@ class TimingState:
         self.win_seen.clear()
         self.missed_windows_same_lap.clear()
         self.session_group = None
+        # Clear driver registry when a new session starts. Drivers from a prior
+        # session should not leak into a new session's timing state (they
+        # otherwise cause stale entries and incorrect publishes).
+        self.drivers.clear()
 
 # ---------------------- Orbits feed parser ----------------------
 
@@ -530,8 +701,7 @@ class DBIngestor:
         self.current_event_id: Optional[int] = None
         self.current_class_id: Optional[int] = None
         self._last_session_id: Optional[int] = None
-        # throttle live publishing (seconds)
-        self._last_live_publish: float = 0.0
+        # (live publish handled by background worker)
 
     # ---- Event/Class with safe rename/merge ----
 
@@ -887,20 +1057,15 @@ class DBIngestor:
                         sess.ended_at = datetime.now(timezone.utc)
                     db.commit()
 
-            # Live publishing of provisional heat points (throttled ~1s)
+            # Enqueue a background publish task for this session (non-blocking)
             try:
                 from sn28_config import CFG as _CFG
                 if getattr(_CFG.app, "publish_points", False):
-                    now = time.time()
-                    if now - self._last_live_publish >= 1.0:
-                        # import locally to avoid circular imports at module load
-                        try:
-                            from sheets_publish import publish_live_heat_points
-                            publish_live_heat_points(sess.id)
-                        except Exception:
-                            # don't let publishing failures interrupt ingest
-                            pass
-                        self._last_live_publish = now
+                    try:
+                        _enqueue_publish(sess.id)
+                    except Exception:
+                        # swallow to avoid impacting ingest
+                        logging.getLogger(__name__).exception("Failed to enqueue live publish for session %s", getattr(sess, 'id', None))
             except Exception:
                 pass
 
@@ -983,7 +1148,7 @@ def main():
     ingestor = DBIngestor(SessionLocal)  # resolved from packets
 
     logging.info("Starting Orbits TCP reader on %s:%s", args.host, args.port)
-    OrbitsTCPReader(
+    reader = OrbitsTCPReader(
         host=args.host,
         port=args.port,
         parser=parser,
@@ -991,7 +1156,18 @@ def main():
         connect_timeout=5.0,
         read_timeout=5.0,
         max_backoff=10.0,
-    ).run()
+    )
+    try:
+        reader.run()
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).info("Interrupted, stopping reader")
+        reader.stop()
+    finally:
+        # ensure publish worker drains pending publishes before exit
+        try:
+            stop_publish_worker(timeout=3.0)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
