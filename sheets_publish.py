@@ -4,6 +4,7 @@ from typing import List, Dict, Tuple, Optional, Any
 from datetime import datetime
 import json
 import os
+import threading
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -308,6 +309,8 @@ def publish_live_heat_points(session_id: int) -> None:
         ]
 
         rows: List[List[Any]] = []
+        # collect signature items (driver_id, position, total_points) to detect changes
+        sig_items: List[Tuple[int, int, int]] = []
         for r in prov:
             driver = db.get(Driver, r["driver_id"]) if r.get("driver_id") else None
             # resolve number
@@ -317,6 +320,9 @@ def publish_live_heat_points(session_id: int) -> None:
                     if e.event_id == sess.event_id and e.class_id == sess.class_id:
                         number = e.number or ""
                         break
+            pos = r.get("position")
+            total = int(r.get("total_points", 0) or 0)
+            sig_items.append((int(r.get("driver_id") or 0), int(pos) if pos is not None else -1, total))
             rows.append([
                 sess.event_id if sess else None,
                 sess.class_id if sess else None,
@@ -327,15 +333,30 @@ def publish_live_heat_points(session_id: int) -> None:
                 "provisional",
                 ver or "",
                 r.get("driver_id"),
-                r.get("position") or "",
+                pos or "",
                 number,
                 getattr(driver, "first_name", "") if driver else "",
                 getattr(driver, "last_name", "") if driver else "",
                 r.get("base_points", 0),
                 r.get("bonus_points", 0),
-                r.get("total_points", 0),
+                total,
                 now_utc,
             ])
+
+    # deterministic signature for this session
+    sig = tuple(sorted(sig_items))
+
+    # setup per-function cache and lock
+    if not hasattr(publish_live_heat_points, "_cache"):
+        publish_live_heat_points._cache = {}
+        publish_live_heat_points._lock = threading.Lock()
+
+    with publish_live_heat_points._lock:
+        prev = publish_live_heat_points._cache.get(session_id)
+        if prev == sig:
+            # no change -> skip write
+            return
+        publish_live_heat_points._cache[session_id] = sig
 
     # Merge/update: keep existing rows not matching this session+class, replace matching ones
     try:
