@@ -8,7 +8,7 @@ import threading
 
 import gspread
 from google.oauth2.service_account import Credentials
-from sqlalchemy import func
+from sqlalchemy import func, and_
 
 from sn28_config import CFG
 from db import SessionLocal
@@ -321,7 +321,28 @@ def publish_live_heat_points(session_id: int) -> None:
                         number = e.number or ""
                         break
             pos = r.get("position")
-            total = int(r.get("total_points", 0) or 0)
+            session_total = int(r.get("total_points", 0) or 0)
+            # include previously awarded official points (qualifying/other heats) for this event/class
+            prev_points = 0
+            if driver and sess:
+                try:
+                    prev_points = int(
+                        db.query(func.coalesce(func.sum(PointAward.total_points), 0))
+                          .filter(
+                              PointAward.driver_id == driver.id,
+                              PointAward.basis == "official",
+                              PointAward.session_id != session_id,
+                          )
+                          .filter(PointAward.session.has(and_(
+                              RaceSession.event_id == sess.event_id,
+                              RaceSession.class_id == sess.class_id
+                          )))
+                          .scalar() or 0
+                    )
+                except Exception:
+                    prev_points = 0
+
+            total = prev_points + session_total
             sig_items.append((int(r.get("driver_id") or 0), int(pos) if pos is not None else -1, total))
             rows.append([
                 sess.event_id if sess else None,
@@ -364,6 +385,25 @@ def publish_live_heat_points(session_id: int) -> None:
     except Exception:
         existing = []
 
+    # If the sheet contains rows for a different session, assume a new session
+    # has started and clear the tab before writing the fresh session's rows.
+    other_session_present = False
+    if existing and len(existing) > 1:
+        for row in existing[1:]:
+            r_session = row[3] if len(row) > 3 else ""
+            if str(r_session) and str(r_session) != str(sess.id):
+                other_session_present = True
+                break
+
+    # If other sessions are present, clear and write only our header+rows
+    if other_session_present:
+        ws.clear()
+        payload = [header] + rows
+        if payload:
+            ws.update(range_name="A1", values=payload, value_input_option="USER_ENTERED")  # type: ignore[arg-type]
+        return
+
+    # Otherwise merge/update: keep existing rows not matching this session+class, replace matching ones
     new_body: List[List[Any]] = []
     session_label = f"{sess.session_type} - {sess.session_name or ''}" if sess else ""
     cls_name = class_name
