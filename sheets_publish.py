@@ -17,7 +17,7 @@ from models import (
     Result, Driver, Entry,
     PointAward, Point, PointScale,
 )
-from official import compute_provisional_heat_points
+from official import compute_provisional_heat_points, compute_official_order
 from sn28_config import CFG
 
 # =========================
@@ -297,7 +297,6 @@ def publish_live_heat_points(session_id: int) -> None:
 
     with SessionLocal() as db:
         sess = _get_session(db, session_id)
-        prov = compute_provisional_heat_points(db, session_id)
 
         class_name = getattr(sess.race_class, "name", "") if sess else ""
         ver = None
@@ -309,60 +308,148 @@ def publish_live_heat_points(session_id: int) -> None:
         ]
 
         rows: List[List[Any]] = []
-        # collect signature items (driver_id, position, total_points) to detect changes
         sig_items: List[Tuple[int, int, int]] = []
-        for r in prov:
-            driver = db.get(Driver, r["driver_id"]) if r.get("driver_id") else None
-            # resolve number
-            number = ""
-            if driver and sess:
-                for e in driver.entries:
-                    if e.event_id == sess.event_id and e.class_id == sess.class_id:
-                        number = e.number or ""
-                        break
-            pos = r.get("position")
-            session_total = int(r.get("total_points", 0) or 0)
-            # include previously awarded official points (qualifying/other heats) for this event/class
-            prev_points = 0
-            if driver and sess:
-                try:
-                    prev_points = int(
-                        db.query(func.coalesce(func.sum(PointAward.total_points), 0))
-                          .filter(
-                              PointAward.driver_id == driver.id,
-                              PointAward.basis == "official",
-                              PointAward.session_id != session_id,
-                          )
-                          .filter(PointAward.session.has(and_(
-                              RaceSession.event_id == sess.event_id,
-                              RaceSession.class_id == sess.class_id
-                          )))
-                          .scalar() or 0
-                    )
-                except Exception:
-                    prev_points = 0
 
-            total = prev_points + session_total
-            sig_items.append((int(r.get("driver_id") or 0), int(pos) if pos is not None else -1, total))
-            rows.append([
-                sess.event_id if sess else None,
-                sess.class_id if sess else None,
-                class_name,
-                sess.id if sess else None,
-                sess.session_type if sess else "",
-                (sess.session_name or "") if sess else "",
-                "provisional",
-                ver or "",
-                r.get("driver_id"),
-                pos or "",
-                number,
-                getattr(driver, "first_name", "") if driver else "",
-                getattr(driver, "last_name", "") if driver else "",
-                r.get("base_points", 0),
-                r.get("bonus_points", 0),
-                total,
-                now_utc,
-            ])
+        # Special handling: merge multiple qualifying groups (Q1, Q2) for same event/class
+        if sess.session_type == "Qualifying":
+            # gather all qualifying sessions for this event/class
+            qual_sids = [sid for (sid,) in db.query(RaceSession.id)
+                         .filter(RaceSession.event_id == sess.event_id,
+                                 RaceSession.class_id == sess.class_id,
+                                 RaceSession.session_type == "Qualifying").all()]
+
+            # build merged views keyed by driver_id using compute_official_order per sub-session
+            merged_views: Dict[int, Dict[str, Any]] = {}
+            for sid in qual_sids:
+                preview = compute_official_order(db, sid)
+                for rv in preview:
+                    if rv.driver_id is None:
+                        continue
+                    # prefer best lap_ms (lower) for ordering
+                    existing = merged_views.get(rv.driver_id)
+                    rv_best = int(rv.best_lap_ms) if rv.best_lap_ms is not None else 10**9
+                    existing_best = existing["best_lap_ms_norm"] if existing and ("best_lap_ms_norm" in existing) and existing.get("best_lap_ms_norm") is not None else 10**9
+                    if not existing or rv_best < existing_best:
+                        merged_views[rv.driver_id] = {
+                            "driver_id": rv.driver_id,
+                            "best_lap_ms": rv.best_lap_ms,
+                            "best_lap_ms_norm": rv_best,
+                            "last_lap_ms": rv.last_lap_ms,
+                            "status_code": rv.status_code,
+                        }
+
+            # produce ordered list by best_lap_ms
+            merged_list = [v for v in merged_views.values() if v.get("status_code") != "DQ"]
+            merged_list.sort(key=lambda r: r.get("best_lap_ms_norm", 10**9))
+
+            # assign positions
+            for i, mv in enumerate(merged_list, start=1):
+                driver = db.get(Driver, mv["driver_id"]) if mv.get("driver_id") else None
+                number = ""
+                if driver and sess:
+                    for e in driver.entries:
+                        if e.event_id == sess.event_id and e.class_id == sess.class_id:
+                            number = e.number or ""
+                            break
+
+                # compute base points using qualifying scale (stored as 1..N in DB)
+                pt = db.query(Point).filter(Point.name == CFG.app.points_scheme).first()
+                if not pt:
+                    base_int = 0
+                else:
+                    scale = db.query(PointScale).filter(PointScale.point_id == pt.id, PointScale.session_type == "Qualifying", PointScale.position == i).first()
+                    base_int = int(scale.points) if scale and scale.points is not None else 0
+
+                # include previously awarded official points for other sessions (exclude merged sids)
+                prev_points = int(db.query(func.coalesce(func.sum(PointAward.total_points), 0))
+                                  .filter(PointAward.driver_id == mv["driver_id"],
+                                          PointAward.basis == "official",
+                                          ~PointAward.session_id.in_(qual_sids))
+                                  .scalar() or 0)
+
+                # Display qualifying as fractional hundredths (e.g., 1 -> 0.01)
+                base_display = float(base_int) / 100.0
+                bonus_display = 0.0
+                total_display = float(prev_points) + base_display
+
+                # signature uses integer hundredths to avoid float equality issues
+                sig_total_hundredths = int(round(total_display * 100))
+                sig_items.append((int(mv["driver_id"]), i, sig_total_hundredths))
+                rows.append([
+                    sess.event_id if sess else None,
+                    sess.class_id if sess else None,
+                    class_name,
+                    sess.id if sess else None,
+                    sess.session_type if sess else "",
+                    (sess.session_name or "") if sess else "",
+                    "provisional",
+                    ver or "",
+                    mv["driver_id"],
+                    i,
+                    number,
+                    getattr(driver, "first_name", "") if driver else "",
+                    getattr(driver, "last_name", "") if driver else "",
+                    base_display,
+                    bonus_display,
+                    total_display,
+                    now_utc,
+                ])
+
+        else:
+            prov = compute_provisional_heat_points(db, session_id)
+            for r in prov:
+                driver = db.get(Driver, r["driver_id"]) if r.get("driver_id") else None
+                number = ""
+                if driver and sess:
+                    for e in driver.entries:
+                        if e.event_id == sess.event_id and e.class_id == sess.class_id:
+                            number = e.number or ""
+                            break
+                pos = r.get("position")
+                session_total = int(r.get("total_points", 0) or 0)
+
+                prev_points = 0
+                if driver and sess:
+                    try:
+                        prev_points = int(
+                            db.query(func.coalesce(func.sum(PointAward.total_points), 0))
+                              .filter(
+                                  PointAward.driver_id == driver.id,
+                                  PointAward.basis == "official",
+                                  PointAward.session_id != session_id,
+                              )
+                              .filter(PointAward.session.has(and_(
+                                  RaceSession.event_id == sess.event_id,
+                                  RaceSession.class_id == sess.class_id
+                              )))
+                              .scalar() or 0
+                        )
+                    except Exception:
+                        prev_points = 0
+
+                total = prev_points + session_total
+                # normalize signature to hundredths for consistent cache keys
+                sig_total_hundredths = int(round(float(total) * 100))
+                sig_items.append((int(r.get("driver_id") or 0), int(pos) if pos is not None else -1, sig_total_hundredths))
+                rows.append([
+                    sess.event_id if sess else None,
+                    sess.class_id if sess else None,
+                    class_name,
+                    sess.id if sess else None,
+                    sess.session_type if sess else "",
+                    (sess.session_name or "") if sess else "",
+                    "provisional",
+                    ver or "",
+                    r.get("driver_id"),
+                    pos or "",
+                    number,
+                    getattr(driver, "first_name", "") if driver else "",
+                    getattr(driver, "last_name", "") if driver else "",
+                    r.get("base_points", 0),
+                    r.get("bonus_points", 0),
+                    total,
+                    now_utc,
+                ])
 
     # deterministic signature for this session
     sig = tuple(sorted(sig_items))
