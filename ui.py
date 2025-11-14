@@ -150,7 +150,7 @@ def autosize_treeview_columns(tv: ttk.Treeview, columns: List[str], padding: int
 class PenaltyApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SuperNats Penalty Pad")
+        self.title("KC Points Tracker")
         self.geometry("1150x700")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -172,11 +172,15 @@ class PenaltyApp(tk.Tk):
         self.session_cb = ttk.Combobox(top, state="readonly", width=60)
         self.session_cb.pack(side="left", padx=6)
         self.session_cb.bind("<<ComboboxSelected>>", self.on_session_change)
-        ttk.Button(top, text="Refresh", command=self.refresh_sessions).pack(side="left", padx=4)
-        # Auto-refresh toggle: when enabled, poll refresh_all() every 500ms
-        ttk.Checkbutton(top, text="Auto Refresh (0.5s)", variable=self.auto_refresh_var,
-                        command=lambda: self._on_auto_refresh_toggle()).pack(side="left", padx=6)
-        ttk.Button(top, text="Publish Official → Sheets", command=self.publish_official).pack(side="right")
+        # Auto-refresh is always enabled in this build — remove manual refresh control
+        # and start the periodic refresh loop. This ensures the UI stays live.
+        self.auto_refresh_var.set(True)
+        try:
+            self._start_auto_refresh()
+            self.status.set("Auto-refresh: ON")
+        except Exception:
+            pass
+        ttk.Button(top, text="Publish Session Results", command=self.publish_official).pack(side="right")
         ttk.Button(top, text="Publish Heat Totals (Class)", command=self.publish_heat_totals_for_class).pack(side="right", padx=(0,6))
         ttk.Button(top, text="Publish Prefinal Grid (Class)", command=self.publish_prefinal_for_class).pack(side="right", padx=(0,6))
 
