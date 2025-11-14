@@ -397,6 +397,17 @@ def publish_live_heat_points(session_id: int) -> None:
 
         else:
             prov = compute_provisional_heat_points(db, session_id)
+
+            # Determine whether this session should contribute provisional points
+            is_practice = (getattr(sess, "session_type", "") == "Practice")
+            is_heat = (getattr(sess, "session_type", "") == "Heat")
+            name_norm = (sess.session_name or "").strip().upper() if sess else ""
+            # Heuristic: treat session names that start with 'B', like 'B1', 'B-1', or contain 'B PACKET'
+            is_b_packet = False
+            if name_norm:
+                if name_norm.startswith("B") or "B PACKET" in name_norm:
+                    is_b_packet = True
+
             for r in prov:
                 driver = db.get(Driver, r["driver_id"]) if r.get("driver_id") else None
                 number = ""
@@ -407,6 +418,12 @@ def publish_live_heat_points(session_id: int) -> None:
                             break
                 pos = r.get("position")
                 session_total = int(r.get("total_points", 0) or 0)
+
+                # Suppress adding provisional points for practice sessions or heats
+                # that are not part of the B-packet. Only B-packet heats should
+                # contribute provisional heat points to the live totals.
+                if is_practice or (is_heat and not is_b_packet):
+                    session_total = 0
 
                 prev_points = 0
                 if driver and sess:

@@ -161,7 +161,13 @@ class PenaltyApp(tk.Tk):
         self._settings: Dict[str, str] = self._load_settings()
         # Top: session picker + info + publish
         # Auto-refresh state (UI polling for latest results)
-        self.auto_refresh_var = tk.BooleanVar(value=False)
+        # Default from persisted settings (string stored), else True
+        try:
+            ar = self._settings.get("auto_refresh", "True")
+            ar_val = True if str(ar).lower() in ("1", "true", "yes") else False
+        except Exception:
+            ar_val = True
+        self.auto_refresh_var = tk.BooleanVar(value=ar_val)
         self._auto_refresh_job: Optional[object] = None
 
         # Top: session picker + info + publish
@@ -172,14 +178,10 @@ class PenaltyApp(tk.Tk):
         self.session_cb = ttk.Combobox(top, state="readonly", width=60)
         self.session_cb.pack(side="left", padx=6)
         self.session_cb.bind("<<ComboboxSelected>>", self.on_session_change)
-        # Auto-refresh is always enabled in this build — remove manual refresh control
-        # and start the periodic refresh loop. This ensures the UI stays live.
-        self.auto_refresh_var.set(True)
-        try:
-            self._start_auto_refresh()
-            self.status.set("Auto-refresh: ON")
-        except Exception:
-            pass
+        # Manual refresh control + Auto-refresh checkbox
+        ttk.Checkbutton(top, text="Auto-refresh", variable=self.auto_refresh_var,
+                        command=self._on_auto_refresh_toggle).pack(side="left", padx=(6,0))
+        ttk.Button(top, text="Refresh", command=lambda: (self.refresh_all(), self.status.set("Manual refresh"))).pack(side="left", padx=(6,6))
         ttk.Button(top, text="Publish Session Results", command=self.publish_official).pack(side="right")
         ttk.Button(top, text="Publish Heat Totals (Class)", command=self.publish_heat_totals_for_class).pack(side="right", padx=(0,6))
         ttk.Button(top, text="Publish Prefinal Grid (Class)", command=self.publish_prefinal_for_class).pack(side="right", padx=(0,6))
@@ -291,6 +293,16 @@ class PenaltyApp(tk.Tk):
         # Status bar
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=8, pady=(0,6))
+
+        # Start auto-refresh if the checkbox was set from persisted settings
+        try:
+            if getattr(self, "auto_refresh_var", None) and self.auto_refresh_var.get():
+                self._start_auto_refresh()
+                self.status.set("Auto-refresh: ON")
+            else:
+                self.status.set("Auto-refresh: OFF")
+        except Exception:
+            pass
 
         # Shortcuts
         self.bind("<Return>", lambda e: self.add_penalty())
@@ -523,6 +535,8 @@ class PenaltyApp(tk.Tk):
         data = {
             "orbits_host": (host or "127.0.0.1").strip(),
             "orbits_port": (port or "50000").strip(),
+            # persist whether the user wants auto-refresh enabled
+            "auto_refresh": str(bool(getattr(self, "auto_refresh_var", tk.BooleanVar(value=True)).get())),
         }
         p = self._settings_file()
         with p.open("w", encoding="utf-8") as f:
