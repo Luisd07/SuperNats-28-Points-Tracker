@@ -47,7 +47,7 @@ def _ensure_publish_worker_started() -> None:
     worker runs as a daemon thread and swallows exceptions to avoid
     impacting the ingest path.
     """
-    global _publish_worker_thread
+    global _publish_worker_thread, _publish_stop_event
     if _publish_worker_thread and _publish_worker_thread.is_alive():
         return
 
@@ -101,7 +101,6 @@ def _ensure_publish_worker_started() -> None:
                 time.sleep(1.0)
 
     # create/clear stop event
-    global _publish_stop_event
     # create a fresh stop event if missing or previously set
     if _publish_stop_event is None or (_publish_stop_event is not None and _publish_stop_event.is_set()):
         _publish_stop_event = threading.Event()
@@ -155,10 +154,8 @@ def stop_publish_worker(timeout: float = 5.0) -> None:
     else:
         logger.debug("Publish worker stopped")
 
-    # clear thread handle
+    # clear thread handle and clear stop event so worker can be restarted later
     _publish_worker_thread = None
-    # Clear stop event so worker can be restarted later
-    global _publish_stop_event
     _publish_stop_event = None
 
     # perform a final synchronous drain to ensure last session publishes ran
